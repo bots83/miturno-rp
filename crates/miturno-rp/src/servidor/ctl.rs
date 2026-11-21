@@ -176,7 +176,8 @@ async fn conexion<S: SesionPs5>(e: Arc<EstadoServidor<S>>, mut socket: WebSocket
     let cred = match validar_con(&token, &e.clave, ahora_s) {
         Ok(c) => c,
         Err(err) => {
-            crate::info!("ctl: credencial rechazada ({})", err.codigo());
+            static LIM: crate::registro::Limitado = crate::registro::Limitado::new();
+            crate::limitado!(6, LIM, "ctl: credencial rechazada ({})", err.codigo());
             return despedir(socket, Some(MsgServidor::error(err.codigo()))).await;
         }
     };

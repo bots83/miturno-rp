@@ -214,7 +214,8 @@ async fn solo_local(ConnectInfo(par): ConnectInfo<SocketAddr>, req: Request, nex
     let h = req.headers();
     let por_proxy = h.contains_key("x-forwarded-for") || h.contains_key(header::FORWARDED) || h.contains_key("x-real-ip");
     if !par.ip().to_canonical().is_loopback() || por_proxy {
-        crate::aviso!("servidor: pedido a {} rechazado (no es local)", req.uri().path());
+        static LIM: crate::registro::Limitado = crate::registro::Limitado::new();
+        crate::limitado!(4, LIM, "servidor: pedido a {} rechazado (no es local)", req.uri().path());
         return codigo(StatusCode::FORBIDDEN, "LOCAL");
     }
     next.run(req).await
@@ -249,7 +250,8 @@ fn permitir_mediamtx(p: &PedidoAuth, clave: &ClaveVerificacion, ahora_s: u64) ->
 
 async fn auth_mediamtx<S: SesionPs5>(State(e): State<Compartido<S>>, cuerpo: Bytes) -> StatusCode {
     let Ok(p) = serde_json::from_slice::<PedidoAuth>(&cuerpo) else {
-        crate::aviso!("interno/auth: cuerpo inválido; rechazado");
+        static LIM: crate::registro::Limitado = crate::registro::Limitado::new();
+        crate::limitado!(4, LIM, "interno/auth: cuerpo inválido; rechazado");
         return StatusCode::UNAUTHORIZED;
     };
     let permitido = permitir_mediamtx(&p, &e.clave, (e.reloj_s)());
@@ -284,7 +286,8 @@ async fn con_token<S: SesionPs5>(State(e): State<Compartido<S>>, req: Request, n
         .and_then(|v| v.as_bytes().strip_prefix(b"Bearer "))
         .is_some_and(|t| e.token_control.coincide(t));
     if !valido {
-        crate::aviso!("control: pedido a {} sin token válido", req.uri().path());
+        static LIM: crate::registro::Limitado = crate::registro::Limitado::new();
+        crate::limitado!(4, LIM, "control: pedido a {} sin token válido", req.uri().path());
         return codigo(StatusCode::UNAUTHORIZED, "TOKEN");
     }
     next.run(req).await
