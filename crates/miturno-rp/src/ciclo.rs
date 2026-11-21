@@ -2,6 +2,8 @@
 //! (`rp_core::reintento`): por red, 1, 2, 4 y después cada 5 s; si la PS5 dice "Remote is already in
 //! use", cada 3 s y sin despertarla de nuevo; por otro motivo (versión, PIN, el hilo de libchiaki
 //! muerto…), creciente hasta 30 s. Mientras tanto la salida nunca se corta: muestra el cartel.
+//! Si la PS5 cierra la sesión ella misma ("Server shutting down": alguien usa la consola en forma
+//! local), no la retoma: queda en `TomadaLocal`, con el cartel, hasta `/control/reconectar`.
 //! Ante SIGTERM cierra la sesión con `session.stop()` (vía `detener()`) y termina en menos de 5 s.
 //! Recibe órdenes del servidor (`/control/*`): reconectar, reposo (la PS5 se apaga y el ciclo queda en
 //! pausa, si no la volvería a despertar) y encender (sale de la pausa). Escribe las métricas de la salud.
@@ -14,7 +16,7 @@ use crate::config::Perfil;
 use crate::metricas::{EstadoSesion, Metricas};
 use crate::mux::Destino;
 use crate::salida::Salida;
-use crate::sesion::{EventoSesion, SesionPs5};
+use crate::sesion::{EventoSesion, MotivoCierre, SesionPs5};
 use rp_core::reintento::ESPERA_INICIAL;
 use rp_core::{Causa, Reintentos};
 use tokio::sync::mpsc;
@@ -61,6 +63,9 @@ enum Estado {
     Esperando { hasta: Instant, despertar: bool },
     Conectando { desde: Instant },
     Conectada { desde: Instant, ultimo_video: Instant },
+    /// La PS5 cerró la sesión porque alguien la usa en forma local: no se retoma sola, hasta
+    /// `Orden::Reconectar` (o `Orden::Encender`).
+    TomadaLocal,
     /// En pausa por `Orden::Reposo`: no se despierta ni se conecta hasta `Orden::Encender`.
     /// `cerrar_en`: cuándo cerrar con `stop()` la sesión, por si la PS5 no la terminó al dormirse.
     Reposo { cerrar_en: Option<Instant> },
@@ -73,6 +78,7 @@ impl Estado {
             Estado::Conectando { desde } => Some(desde + PLAZO_CONEXION),
             Estado::Conectada { ultimo_video, .. } => Some(ultimo_video + SIN_VIDEO),
             Estado::Reposo { cerrar_en } => cerrar_en,
+            Estado::TomadaLocal => None,
         }
     }
 
@@ -82,6 +88,7 @@ impl Estado {
             Estado::Conectando { .. } => EstadoSesion::Conectando,
             Estado::Esperando { .. } => EstadoSesion::Caida,
             Estado::Reposo { .. } => EstadoSesion::Reposo,
+            Estado::TomadaLocal => EstadoSesion::TomadaLocal,
         }
     }
 }
@@ -185,7 +192,7 @@ where
                             Estado::Conectada { desde, .. } => Some(ahora - desde),
                             Estado::Conectando { .. } => Some(Duration::ZERO),
                             // En reposo la PS5 cierra la sesión al dormirse: no se reintenta.
-                            Estado::Esperando { .. } | Estado::Reposo { .. } => None,
+                            Estado::Esperando { .. } | Estado::Reposo { .. } | Estado::TomadaLocal => None,
                         };
                         if let Some(duro) = duro {
                             crate::info!("ciclo: la sesión terminó ({motivo:?}) después de {} s", duro.as_secs());
@@ -193,7 +200,12 @@ where
                             if duro >= SESION_ESTABLE {
                                 reintentos.reiniciar();
                             }
-                            estado = reintentar(&mut reintentos, motivo.causa());
+                            estado = if motivo == MotivoCierre::TomadaLocal {
+                                crate::aviso!("ciclo: la consola se está usando en forma local; no la retomo hasta /control/reconectar");
+                                Estado::TomadaLocal
+                            } else {
+                                reintentar(&mut reintentos, motivo.causa())
+                            };
                         }
                     }
                 }
@@ -220,7 +232,7 @@ where
                         };
                         salida.sesion_caida(t0.elapsed());
                     }
-                    (Orden::Encender, Estado::Reposo { .. } | Estado::Esperando { .. }) => {
+                    (Orden::Encender, Estado::Reposo { .. } | Estado::Esperando { .. } | Estado::TomadaLocal) => {
                         crate::info!("ciclo: encender pedido; despierto la PS5 y conecto");
                         reintentos.reiniciar();
                         estado = Estado::Esperando { hasta: ahora, despertar: true };
@@ -228,6 +240,13 @@ where
                     (Orden::Encender, _) => crate::info!("ciclo: encender pedido, pero ya hay sesión"),
                     (Orden::Reconectar, Estado::Reposo { .. }) => {
                         crate::aviso!("ciclo: reconectar pedido en reposo; no hago nada (para salir de la pausa, encender)");
+                    }
+                    (Orden::Reconectar, Estado::TomadaLocal) => {
+                        // Despierta por si la dejaron en reposo desde la consola; si la PS5 todavía tiene
+                        // la sesión vieja, contesta EnUso y se reintenta cada 3 s.
+                        crate::info!("ciclo: reconectar pedido; retomo la consola");
+                        reintentos.reiniciar();
+                        estado = Estado::Esperando { hasta: ahora, despertar: true };
                     }
                     (Orden::Reconectar, Estado::Esperando { despertar, .. }) => {
                         crate::info!("ciclo: reconectar pedido; adelanto el intento");
@@ -279,6 +298,8 @@ where
                         salida.sesion_caida(t0.elapsed());
                         estado = reintentar(&mut reintentos, Causa::Red);
                     }
+                    // Sin plazo: nunca llega acá.
+                    Estado::TomadaLocal => {}
                     Estado::Reposo { .. } => {
                         crate::info!("ciclo: cierro la sesión que quedó del reposo");
                         tokio::spawn(sesion.detener());
@@ -304,7 +325,6 @@ where
 mod tests {
     use super::*;
     use crate::mux::tests::leer_pes;
-    use crate::sesion::MotivoCierre;
     use crate::mux::ID_VIDEO;
     use crate::salida::tests::cartel_de_prueba;
     use crate::sesion::falsa::SesionFalsa;
@@ -664,6 +684,75 @@ mod tests {
         b.orden(Orden::Encender).await;
         assert_eq!(b.registro().conectar.len(), 2);
         assert_ne!(b.estado(), EstadoSesion::Reposo, "encender sale del reposo");
+        b.terminar().await;
+    }
+
+    /// Conecta, manda un cuadro y a los 2 s la PS5 cierra la sesión porque alguien usó el mando físico.
+    async fn tomada_a_los_2_s(guion_despues: Vec<Vec<EventoSesion>>) -> Banco {
+        let mut guion = vec![vec![EventoSesion::Conectada]];
+        guion.extend(guion_despues);
+        let b = arrancar(guion);
+        sleep(Duration::from_millis(10)).await;
+        b.emisor().send(video(vec![0, 0, 0, 1, 0x65, 0x50, 0])).await.unwrap();
+        sleep(Duration::from_millis(1_990)).await;
+        b.emisor().send(EventoSesion::Cerrada { motivo: MotivoCierre::TomadaLocal }).await.unwrap();
+        sleep(Duration::from_millis(1)).await;
+        b
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn la_consola_tomada_en_forma_local_no_se_retoma_sola() {
+        let b = tomada_a_los_2_s(vec![vec![EventoSesion::Conectada]]).await;
+        assert_eq!(b.estado(), EstadoSesion::TomadaLocal, "la salud lo dice");
+        sleep(Duration::from_millis(50)).await;
+        assert!(b.videos().last().unwrap().1.contains(&0xCA), "vuelve el cartel");
+        sleep(Duration::from_secs(600)).await;
+        let r = b.registro();
+        assert_eq!((r.despertar.len(), r.conectar.len()), (1, 1), "ni despierta ni conecta solo");
+        assert_eq!(b.estado(), EstadoSesion::TomadaLocal);
+        // Llega un Cerrada tardío: no cambia nada.
+        b.emisor().send(EventoSesion::Cerrada { motivo: MotivoCierre::Red }).await.unwrap();
+        sleep(Duration::from_secs(10)).await;
+        assert_eq!((b.registro().conectar.len(), b.estado()), (1, EstadoSesion::TomadaLocal));
+        b.terminar().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconectar_retoma_la_consola_tomada() {
+        let en_uso = vec![EventoSesion::Cerrada { motivo: MotivoCierre::EnUso }];
+        let b = tomada_a_los_2_s(vec![en_uso, vec![EventoSesion::Conectada]]).await;
+        sleep(Duration::from_secs(60)).await;
+        b.orden(Orden::Reconectar).await;
+        let r = b.registro();
+        assert_eq!(r.conectar.len(), 2, "reconectar conecta ya");
+        assert_eq!(r.despertar.len(), 2, "y despierta (por si la dejaron en reposo desde la consola)");
+        // La PS5 todavía tiene la sesión vieja: EnUso, 3 s y conecta.
+        sleep(Duration::from_secs(4)).await;
+        let t = b.segundos(&b.registro().conectar);
+        assert_eq!(t.len(), 3, "{t:?}");
+        assert!((t[1] - 62.0).abs() < 0.01 && (t[2] - t[1] - 3.0).abs() < 0.001, "{t:?}");
+        assert_eq!(b.estado(), EstadoSesion::Conectada);
+        b.terminar().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn encender_tambien_retoma_la_consola_tomada() {
+        let b = tomada_a_los_2_s(vec![vec![EventoSesion::Conectada]]).await;
+        sleep(Duration::from_secs(5)).await;
+        b.orden(Orden::Encender).await;
+        assert_eq!(b.registro().conectar.len(), 2);
+        assert_ne!(b.estado(), EstadoSesion::TomadaLocal);
+        b.terminar().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reposo_con_la_consola_tomada_pasa_a_reposo() {
+        let b = tomada_a_los_2_s(vec![]).await;
+        b.orden(Orden::Reposo).await;
+        assert_eq!(b.registro().reposo, 1);
+        assert_eq!(b.estado(), EstadoSesion::Reposo);
+        b.orden(Orden::Reconectar).await;
+        assert_eq!(b.registro().conectar.len(), 1, "en reposo, reconectar no hace nada");
         b.terminar().await;
     }
 

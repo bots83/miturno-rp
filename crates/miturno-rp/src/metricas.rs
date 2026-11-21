@@ -22,6 +22,10 @@ pub enum EstadoSesion {
     Caida,
     /// En pausa por `/control/reposo` (la PS5 en reposo), hasta `/control/encender`.
     Reposo,
+    /// Alguien usa la consola en forma local (la PS5 cerró la sesión): en pausa hasta `/control/reconectar`
+    /// (o `/control/encender`). En el JSON, `"tomada"`.
+    #[serde(rename = "tomada")]
+    TomadaLocal,
 }
 
 /// Lo que se publica en `VideoSalud.sesion` (los nombres los fija el tipo de la api).
@@ -233,6 +237,12 @@ mod tests {
         let f = m.foto(t0 + Duration::from_secs(1));
         assert_eq!((f.estado, f.fps, f.kbps, f.perdidos), (EstadoSesion::Reposo, 0.0, 0, 0));
         assert_eq!(serde_json::to_value(EstadoSesion::Reposo).unwrap(), serde_json::json!("reposo"));
+    }
+
+    #[test]
+    fn la_consola_tomada_se_informa_como_tomada() {
+        assert_eq!(serde_json::to_value(EstadoSesion::TomadaLocal).unwrap(), serde_json::json!("tomada"));
+        assert_eq!(serde_json::to_value(EstadoSesion::Caida).unwrap(), serde_json::json!("caida"));
     }
 
     #[test]

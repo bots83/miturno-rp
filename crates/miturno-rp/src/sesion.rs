@@ -35,6 +35,10 @@ pub enum MotivoCierre {
     EnUso,
     /// No se pudo conectar o se cortó la conexión.
     Red,
+    /// La PS5 cerró la sesión ella misma ("Server shutting down"; un corte de red no lo puede mandar).
+    /// Medido con la consola real: pasa cuando alguien prende el mando físico y elige perfil. También
+    /// podría ser reposo o apagado desde la consola. El ciclo no la retoma solo: espera `/control/reconectar`.
+    TomadaLocal,
     /// Lo que no se arregla solo: versión de Remote Play, Remote Play caído en la consola, PIN pedido,
     /// falla del control o no se pudo crear la sesión en libchiaki. Se reintenta más espaciado.
     Otro,
@@ -46,7 +50,8 @@ impl MotivoCierre {
         match self {
             MotivoCierre::EnUso => rp_core::Causa::EnUso,
             MotivoCierre::Red => rp_core::Causa::Red,
-            MotivoCierre::Otro => rp_core::Causa::Otra,
+            // El ciclo no reintenta solo con TomadaLocal; si alguna vez lo hiciera, con la espera larga.
+            MotivoCierre::Otro | MotivoCierre::TomadaLocal => rp_core::Causa::Otra,
         }
     }
 }

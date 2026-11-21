@@ -162,8 +162,9 @@ pub fn motivo(r: QuitReason) -> MotivoCierre {
         | CHIAKI_QUIT_REASON_CTRL_CONNECT_FAILED
         | CHIAKI_QUIT_REASON_CTRL_CONNECTION_REFUSED
         | CHIAKI_QUIT_REASON_STREAM_CONNECTION_UNKNOWN
-        | CHIAKI_QUIT_REASON_STREAM_CONNECTION_REMOTE_DISCONNECTED
-        | CHIAKI_QUIT_REASON_STREAM_CONNECTION_REMOTE_SHUTDOWN => MotivoCierre::Red,
+        | CHIAKI_QUIT_REASON_STREAM_CONNECTION_REMOTE_DISCONNECTED => MotivoCierre::Red,
+        // Solo sale si la PS5 manda el texto exacto "Server shutting down" (chiaki-ng, session.c).
+        CHIAKI_QUIT_REASON_STREAM_CONNECTION_REMOTE_SHUTDOWN => MotivoCierre::TomadaLocal,
         _ => MotivoCierre::Otro,
     }
 }
@@ -537,6 +538,8 @@ mod tests {
         assert_eq!(motivo(CHIAKI_QUIT_REASON_CTRL_CONNECT_FAILED), MotivoCierre::Red);
         assert_eq!(motivo(CHIAKI_QUIT_REASON_STREAM_CONNECTION_REMOTE_DISCONNECTED), MotivoCierre::Red);
         assert_eq!(motivo(CHIAKI_QUIT_REASON_SESSION_REQUEST_RP_VERSION_MISMATCH), MotivoCierre::Otro);
+        // "Server shutting down": la cierra la PS5 misma (medido: alguien prendió el mando físico).
+        assert_eq!(motivo(CHIAKI_QUIT_REASON_STREAM_CONNECTION_REMOTE_SHUTDOWN), MotivoCierre::TomadaLocal);
         assert_eq!(super::super::CODIGO_EN_USO, ffi::CHIAKI_RP_APPLICATION_REASON_IN_USE);
     }
 
