@@ -281,7 +281,9 @@ fn abrir<'a>(
             match ev.try_send(e) {
                 Ok(()) => true,
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    // Devolver false hace que libchiaki espere un keyframe: no sale video roto.
+                    // Devolver false: chiaki-ng v1.10.1 no lo toma como cuadro de referencia y, con el
+                    // cuadro siguiente, le manda a la PS5 un `send_corrupt_frame`; la PS5 se recupera sola
+                    // (codifica contra un cuadro que sí llegó), sin esperar un IDR.
                     descartados += 1;
                     if descartados % 60 == 1 {
                         crate::aviso!("sesión: el ciclo no da abasto; van {descartados} cuadros descartados");

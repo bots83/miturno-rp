@@ -1,7 +1,8 @@
 //! Filtro por rol: lo único que separa a un jugador de los menús del sistema de la PS5.
-//! `ahora_ms` debe salir de un reloj monótono (nunca de la hora de pared). Cada mensaje válido del
-//! cliente debe llamar también a `Guardian::latido`.
+//! No tiene reloj: decide solo con la entrada y el rol (`ahora_ms` se ignora; queda en la firma por
+//! si F2 vuelve a necesitar tiempos). El silencio del cliente lo vigila aparte `Guardian`.
 //! Un jugador nunca puede apretar PS ni Create (abren menú, tienda, mensajes, perfil: riesgo de ban).
+//! Options es libre para el jugador, sin ventana ni máximo apretado.
 
 use crate::credencial::Rol;
 use crate::mando::{EstadoMando, CONOCIDOS, CREATE, PS};
