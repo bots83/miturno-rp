@@ -25,7 +25,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use rp_core::{validar_con, ClaveVerificacion, LimitesOptions, Rol};
+use rp_core::{validar_con, ClaveVerificacion, Rol};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use subtle::ConstantTimeEq;
@@ -98,7 +98,6 @@ pub struct Piezas<S: SesionPs5> {
     pub sesion: Arc<ConLimite<S>>,
     pub clave: ClaveVerificacion,
     pub token_control: TokenControl,
-    pub limites: LimitesOptions,
     pub ordenes: mpsc::Sender<Orden>,
     pub metricas: Arc<Metricas>,
     pub sistema: Arc<dyn Sistema>,
@@ -110,7 +109,6 @@ pub struct EstadoServidor<S: SesionPs5> {
     sesion: Arc<ConLimite<S>>,
     clave: ClaveVerificacion,
     token_control: TokenControl,
-    limites: LimitesOptions,
     ordenes: mpsc::Sender<Orden>,
     metricas: Arc<Metricas>,
     sistema: Arc<dyn Sistema>,
@@ -134,7 +132,6 @@ impl<S: SesionPs5> EstadoServidor<S> {
             sesion: p.sesion,
             clave: p.clave,
             token_control: p.token_control,
-            limites: p.limites,
             ordenes: p.ordenes,
             metricas: p.metricas,
             sistema: p.sistema,

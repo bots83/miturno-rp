@@ -16,7 +16,7 @@ use ed25519_dalek::SigningKey;
 use futures_util::{SinkExt, StreamExt};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use rp_core::mando::{CREATE, CRUZ, OPTIONS, PS};
-use rp_core::{EstadoMando, LimitesOptions};
+use rp_core::EstadoMando;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -109,7 +109,6 @@ fn banco() -> Banco {
         sesion: sesion.clone(),
         clave: rp_core::ClaveVerificacion::desde_pem(&par(1).1).unwrap(),
         token_control: TokenControl::new(TOKEN_CONTROL).unwrap(),
-        limites: LimitesOptions::default(),
         ordenes: tx_ordenes,
         metricas: metricas.clone(),
         sistema: sistema.clone(),
@@ -421,22 +420,18 @@ async fn ctl_mensaje_invalido_suelta_y_cierra_con_formato() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn ctl_options_del_jugador_se_suelta_a_los_2_s_solo_con_latidos() {
+async fn ctl_options_del_jugador_sigue_apretado_sin_soltarse_a_los_2_s() {
     let b = banco();
     let (mut ws, _) = b.ws_con(&token("jugador")).await;
     enviar(&mut ws, estado_json(OPTIONS)).await;
     sleep(Duration::from_millis(5)).await;
     assert_eq!(b.ultimo_mando(), con(OPTIONS));
-    for _ in 0..9 {
+    for _ in 0..15 {
         sleep(Duration::from_millis(200)).await;
         enviar(&mut ws, json!({"t":"latido"})).await;
     }
-    sleep(Duration::from_millis(5)).await; // 1,81 s
-    assert_eq!(b.ultimo_mando(), con(OPTIONS), "antes de 2 s sigue apretado");
-    sleep(Duration::from_millis(195)).await;
-    enviar(&mut ws, json!({"t":"latido"})).await;
-    sleep(Duration::from_millis(200)).await; // 2,2 s, sin ningún estado nuevo
-    assert_eq!(b.ultimo_mando(), con(0), "pasados 2 s se fuerza suelto aunque solo lleguen latidos");
+    sleep(Duration::from_millis(5)).await; // 3 s, solo latidos
+    assert_eq!(b.ultimo_mando(), con(OPTIONS), "Options es libre: nadie lo fuerza a suelto");
 }
 
 #[tokio::test(start_paused = true)]

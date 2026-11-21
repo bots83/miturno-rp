@@ -8,7 +8,7 @@ pub mod mando;
 pub mod protocolo;
 
 pub use credencial::{validar, validar_con, ClaveVerificacion, Credencial, ErrorClave, ErrorCredencial, Rol};
-pub use filtro::{Filtro, LimitesOptions};
+pub use filtro::Filtro;
 pub use guardian::Guardian;
 pub use limitador::LimitadorKeyframe;
 pub use mando::EstadoMando;

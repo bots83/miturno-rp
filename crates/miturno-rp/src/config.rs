@@ -23,8 +23,6 @@ pub struct Config {
     pub http: String,
     /// Cartel "Volvemos enseguida" pregrabado (MPEG-TS de 2 s).
     pub cartel: PathBuf,
-    pub options_intervalo_ms: u64,
-    pub options_max_ms: u64,
     /// Clave pública con la que se validan las credenciales de turno (Task 5).
     pub clave_publica: PathBuf,
     /// Token de servidor a servidor de los endpoints de control (Task 5).
@@ -254,8 +252,6 @@ bitrate_kbps = 8000
 salida_udp = "127.0.0.1:9000"
 http = "127.0.0.1:7070"
 cartel = "/var/lib/miturno-video/cartel.ts"
-options_intervalo_ms = 30000
-options_max_ms = 2000
 clave_publica = "/etc/miturno-video/ct-public.pem"
 token_control = "/etc/miturno-video/control.token"
 "#;
@@ -274,8 +270,6 @@ token_control = "/etc/miturno-video/control.token"
                 salida_udp: "127.0.0.1:9000".into(),
                 http: "127.0.0.1:7070".into(),
                 cartel: r("/var/lib/miturno-video/cartel.ts"),
-                options_intervalo_ms: 30000,
-                options_max_ms: 2000,
                 clave_publica: r("/etc/miturno-video/ct-public.pem"),
                 token_control: r("/etc/miturno-video/control.token"),
             }

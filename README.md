@@ -28,7 +28,7 @@ Corre en el servidor de video de MiTurno. **Este repo no tiene secretos ni datos
 miturno-rp [--config /etc/miturno-video/rp.toml] [--casa /etc/miturno-video/casa.env] [--ps5 /etc/miturno-video/ps5.env]
 ```
 
-- `rp.toml` (plantilla en `config/rp.toml`, sin secretos): bitrate, destino UDP del MPEG-TS, dirección HTTP local, cartel, límites de Options, clave pública y token de control.
+- `rp.toml` (plantilla en `config/rp.toml`, sin secretos): bitrate, destino UDP del MPEG-TS, dirección HTTP local, cartel, clave pública y token de control.
 - `casa.env`: `PS5_HOST` (nombre de la conexión de casa; privado, no se registra).
 - `ps5.env` (600): `PS5_REGIST_KEY`, `PS5_MORNING`, `PS5_ACCOUNT_ID` (secretos; nunca se imprimen).
 

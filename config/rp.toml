@@ -5,7 +5,5 @@ bitrate_kbps = 8000
 salida_udp = "127.0.0.1:9000"
 http = "127.0.0.1:7070"
 cartel = "/var/lib/miturno-video/cartel.ts"
-options_intervalo_ms = 30000
-options_max_ms = 2000
 clave_publica = "/etc/miturno-video/ct-public.pem"
 token_control = "/etc/miturno-video/control.token"

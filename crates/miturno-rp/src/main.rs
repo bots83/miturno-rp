@@ -16,7 +16,6 @@ use miturno_rp::sesion::libchiaki::SesionLibchiaki;
 use miturno_rp::sesion::{ConLimite, MIN_ENTRE_KEYFRAMES_MS};
 use miturno_rp::sistema::SistemaReal;
 use miturno_rp::{ciclo, falla, info};
-use rp_core::LimitesOptions;
 use tokio::signal::unix::{signal, SignalKind};
 
 fn main() -> ExitCode {
@@ -51,7 +50,6 @@ fn correr(rutas: Rutas) -> Result<(), String> {
     let clave = servidor::cargar_clave_publica(&config.clave_publica)?;
     let token_control = servidor::cargar_token_control(&config.token_control)?;
     let http: std::net::SocketAddr = config.http.parse().expect("validada al cargar la configuración");
-    let limites = LimitesOptions { intervalo_ms: config.options_intervalo_ms, max_apretado_ms: config.options_max_ms };
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -76,7 +74,6 @@ fn correr(rutas: Rutas) -> Result<(), String> {
             sesion: sesion.clone(),
             clave,
             token_control,
-            limites,
             ordenes,
             metricas,
             sistema: Arc::new(SistemaReal),

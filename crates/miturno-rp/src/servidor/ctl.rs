@@ -5,8 +5,7 @@
 //!   (que recibe `reemplazado` y se cierra); una de rol menor recibe `error OCUPADO`.
 //! - Cada mensaje válido es un latido. Con 500 ms de silencio se suelta todo (la conexión sigue); al
 //!   cerrar, al llegar un mensaje inválido, al ser reemplazada o al vencer la credencial, también.
-//! - El estado del mando pasa por el filtro del rol; si Options del jugador llega a su máximo apretado,
-//!   se vuelve a aplicar la última entrada en ese instante aunque solo lleguen latidos.
+//! - El estado del mando pasa por el filtro del rol (el jugador nunca pasa PS ni Create).
 //! - Los pedidos de keyframe pasan por el limitador único (`ConLimite`).
 //!
 //! Solo el controlador actual llega a `poner_mando`, y siempre con la ranura tomada: así el "todo
@@ -191,7 +190,7 @@ async fn conexion<S: SesionPs5>(e: Arc<EstadoServidor<S>>, mut socket: WebSocket
     }
     crate::info!("ctl: conexión {id} (rol={}) controla la PS5", nombre_rol(cred.rol));
 
-    let mut filtro = Filtro::new(cred.rol, e.limites);
+    let mut filtro = Filtro::new(cred.rol);
     let fin = bucle(&e, id, &mut filtro, &mut socket, &mut reemplazo, vence).await;
     // Primero se suelta todo (si todavía controla) y recién después se habla con el cliente.
     drop(dueno);
@@ -218,7 +217,6 @@ async fn bucle<S: SesionPs5>(
     vence: Instant,
 ) -> Fin {
     let mut guardian = Guardian::new(SILENCIO_MS);
-    let mut entrada = EstadoMando::suelto();
     let mut ultimo = e.ahora_ms();
     guardian.latido(ultimo);
     let mut suelto_por_silencio = false;
@@ -226,7 +224,6 @@ async fn bucle<S: SesionPs5>(
 
     loop {
         let silencio = (!suelto_por_silencio).then(|| ms(ultimo + SILENCIO_MS));
-        let options = filtro.vence_en().map(ms);
         tokio::select! {
             biased;
             _ = &mut *reemplazo => return Fin::Reemplazada,
@@ -235,16 +232,10 @@ async fn bucle<S: SesionPs5>(
                 let ahora = e.ahora_ms();
                 if guardian.vencido(ahora) {
                     crate::depurar!("ctl: conexión {id}: {SILENCIO_MS} ms sin mensajes; todo suelto");
-                    entrada = EstadoMando::suelto();
-                    let salida = filtro.aplicar(&entrada, ahora);
+                    let salida = filtro.aplicar(&EstadoMando::suelto(), ahora);
                     e.mandar(id, &salida);
                     suelto_por_silencio = true;
                 }
-            }
-            // Options del jugador llegó al máximo apretado: se vuelve a filtrar la última entrada.
-            _ = sleep_until(options.unwrap_or(vence)), if options.is_some() => {
-                let salida = filtro.aplicar(&entrada, e.ahora_ms());
-                e.mandar(id, &salida);
             }
             leido = leer(socket) => {
                 let m = match leido {
@@ -259,7 +250,7 @@ async fn bucle<S: SesionPs5>(
                 match m {
                     MsgCliente::Auth { .. } => return Fin::Formato,
                     MsgCliente::Estado { botones, l2, r2, lx, ly, rx, ry } => {
-                        entrada = EstadoMando { botones, l2, r2, lx, ly, rx, ry };
+                        let entrada = EstadoMando { botones, l2, r2, lx, ly, rx, ry };
                         let salida = filtro.aplicar(&entrada, ahora);
                         e.mandar(id, &salida);
                         #[cfg(test)]
