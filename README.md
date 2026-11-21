@@ -24,3 +24,20 @@ LIBCHIAKI_PREFIX=/ruta/a/libchiaki-1.10.1 cargo build --release
 ```
 
 La versión de Rust está fijada en `rust-toolchain.toml`.
+
+## Antes de publicar
+
+El hook `.git/hooks/pre-push` (no se versiona; si hace falta, se reinstala con este contenido y `chmod +x`) corre:
+
+```bash
+#!/usr/bin/env bash
+set -e
+cd "$(git rev-parse --show-toplevel)"
+bash scripts/test-chequeo-sin-secretos.sh >/dev/null
+bash scripts/chequeo-sin-secretos.sh --todo
+bash scripts/chequeo-sin-secretos.sh --historial
+bash scripts/test-chequeo-versiones.sh >/dev/null
+bash scripts/chequeo-versiones.sh
+```
+
+`chequeo-versiones.sh` exige que cada paquete de `Cargo.lock`, también los transitivos, tenga 14 días o más desde su publicación. Si falla, se baja con `cargo update -p <crate>@<versión> --precise <anterior>`.
