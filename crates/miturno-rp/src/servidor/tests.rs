@@ -15,7 +15,7 @@ use ed25519_dalek::pkcs8::{EncodePrivateKey, EncodePublicKey};
 use ed25519_dalek::SigningKey;
 use futures_util::{SinkExt, StreamExt};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-use rp_core::mando::{CREATE, CRUZ, OPTIONS, PS};
+use rp_core::mando::{CREATE, CRUZ, L1, OPTIONS, PS};
 use rp_core::EstadoMando;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
@@ -291,7 +291,57 @@ async fn ctl_silencio_de_600_ms_suelta_todo_sin_cerrar() {
     sleep(Duration::from_millis(150)).await;
     assert_eq!(b.ultimo_mando(), EstadoMando::suelto(), "a los 600 ms, todo suelto");
     // La conexión sigue: un estado nuevo vuelve a pasar.
+    enviar(&mut ws, estado_json(L1)).await;
+    sleep(Duration::from_millis(5)).await;
+    assert_eq!(b.ultimo_mando(), con(L1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn ctl_tras_un_hipo_de_red_el_latido_vuelve_a_apretar_lo_mantenido() {
+    let b = banco();
+    let (mut ws, _) = b.ws_con(&token("operador")).await;
+    // Cruz mantenida: el cliente solo manda latidos mientras no cambia nada.
     enviar(&mut ws, estado_json(CRUZ)).await;
+    sleep(Duration::from_millis(600)).await;
+    assert_eq!(b.ultimo_mando(), EstadoMando::suelto(), "600 ms de silencio: todo suelto");
+    enviar(&mut ws, json!({"t":"latido"})).await;
+    sleep(Duration::from_millis(5)).await;
+    assert_eq!(b.ultimo_mando(), con(CRUZ), "vuelve la conexión: Cruz sigue apretada");
+    // Un segundo latido no repite el envío (ya no está suelto por silencio).
+    let antes = b.mandos().len();
+    enviar(&mut ws, json!({"t":"latido"})).await;
+    sleep(Duration::from_millis(5)).await;
+    assert_eq!(b.mandos().len(), antes);
+    // Un pedido de keyframe tras otro hueco también restaura.
+    sleep(Duration::from_millis(600)).await;
+    assert_eq!(b.ultimo_mando(), EstadoMando::suelto());
+    enviar(&mut ws, json!({"t":"keyframe"})).await;
+    sleep(Duration::from_millis(5)).await;
+    assert_eq!(b.ultimo_mando(), con(CRUZ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn ctl_si_el_jugador_solto_durante_el_hueco_el_estado_nuevo_manda() {
+    let b = banco();
+    let (mut ws, _) = b.ws_con(&token("operador")).await;
+    enviar(&mut ws, estado_json(CRUZ)).await;
+    sleep(Duration::from_millis(600)).await;
+    assert_eq!(b.ultimo_mando(), EstadoMando::suelto());
+    // TCP entrega en orden: el estado nuevo (soltó Cruz) llega antes que el latido.
+    enviar(&mut ws, estado_json(0)).await;
+    enviar(&mut ws, json!({"t":"latido"})).await;
+    sleep(Duration::from_millis(5)).await;
+    assert_eq!(b.ultimo_mando(), con(0));
+    assert!(b.mandos().iter().rev().take_while(|m| **m != EstadoMando::suelto()).all(|m| m.botones & CRUZ == 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn ctl_el_jugador_restaurado_tampoco_pasa_ps() {
+    let b = banco();
+    let (mut ws, _) = b.ws_con(&token("jugador")).await;
+    enviar(&mut ws, estado_json(CRUZ | PS)).await;
+    sleep(Duration::from_millis(600)).await;
+    enviar(&mut ws, json!({"t":"latido"})).await;
     sleep(Duration::from_millis(5)).await;
     assert_eq!(b.ultimo_mando(), con(CRUZ));
 }

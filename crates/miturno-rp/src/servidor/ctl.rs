@@ -5,6 +5,9 @@
 //!   (que recibe `reemplazado` y se cierra); una de rol menor recibe `error OCUPADO`.
 //! - Cada mensaje válido es un latido. Con 500 ms de silencio se suelta todo (la conexión sigue); al
 //!   cerrar, al llegar un mensaje inválido, al ser reemplazada o al vencer la credencial, también.
+//!   Si la conexión vuelve después de un silencio (un hipo de red), el primer mensaje válido que no
+//!   sea `estado` vuelve a aplicar la última entrada filtrada: un botón mantenido sigue mantenido.
+//!   Si el jugador soltó durante el hueco, su `estado` nuevo llega antes (TCP entrega en orden) y manda.
 //! - El estado del mando pasa por el filtro del rol (el jugador nunca pasa PS ni Create).
 //! - Los pedidos de keyframe pasan por el limitador único (`ConLimite`).
 //!
@@ -220,6 +223,8 @@ async fn bucle<S: SesionPs5>(
     let mut ultimo = e.ahora_ms();
     guardian.latido(ultimo);
     let mut suelto_por_silencio = false;
+    // Lo último que pasó el filtro: se reaplica si la conexión vuelve después de un silencio.
+    let mut ultima_filtrada = EstadoMando::suelto();
     let ms = |m: u64| e.t0 + Duration::from_millis(m);
 
     loop {
@@ -246,12 +251,17 @@ async fn bucle<S: SesionPs5>(
                 let ahora = e.ahora_ms();
                 guardian.latido(ahora);
                 ultimo = ahora;
-                suelto_por_silencio = false;
+                let volvio_del_silencio = std::mem::take(&mut suelto_por_silencio);
+                if volvio_del_silencio && !matches!(m, MsgCliente::Estado { .. } | MsgCliente::Auth { .. }) {
+                    crate::depurar!("ctl: conexión {id}: volvió tras el silencio; reaplico el último estado");
+                    e.mandar(id, &ultima_filtrada);
+                }
                 match m {
                     MsgCliente::Auth { .. } => return Fin::Formato,
                     MsgCliente::Estado { botones, l2, r2, lx, ly, rx, ry } => {
                         let entrada = EstadoMando { botones, l2, r2, lx, ly, rx, ry };
                         let salida = filtro.aplicar(&entrada, ahora);
+                        ultima_filtrada = salida;
                         e.mandar(id, &salida);
                         #[cfg(test)]
                         if e.panico_en_estado.load(std::sync::atomic::Ordering::SeqCst) {
