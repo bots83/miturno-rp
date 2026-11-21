@@ -6,6 +6,7 @@ pub mod guardian;
 pub mod limitador;
 pub mod mando;
 pub mod protocolo;
+pub mod reintento;
 
 pub use credencial::{validar, validar_con, ClaveVerificacion, Credencial, ErrorClave, ErrorCredencial, Rol};
 pub use filtro::Filtro;
@@ -13,6 +14,7 @@ pub use guardian::Guardian;
 pub use limitador::LimitadorKeyframe;
 pub use mando::EstadoMando;
 pub use protocolo::{leer_mensaje, MsgCliente, MsgServidor};
+pub use reintento::{Causa, Espera, Reintentos};
 
 #[cfg(test)]
 mod tests {
