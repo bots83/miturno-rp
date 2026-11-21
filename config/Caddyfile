@@ -14,6 +14,9 @@
 	servers {
 		# Sin HTTP/3: el UDP 443 no está abierto en ufw.
 		protocols h1 h2
+		# El Host tiene que ser el mismo nombre del SNI: con SNI sp.miturnolive.com y otro Host, 421
+		# (antes respondía 200 vacío a cualquier nombre).
+		strict_sni_host on
 	}
 }
 
@@ -58,6 +61,9 @@ sp.miturnolive.com {
 			header_down -Access-Control-Expose-Headers
 			header_down -Access-Control-Allow-Credentials
 			header_down -Vary
+			# El 401 de MediaMTX traía `WWW-Authenticate: Basic realm="mediamtx"`: delataba el software
+			# y el navegador no lo necesita (el cliente WHEP manda el Bearer solo).
+			header_down -WWW-Authenticate
 		}
 	}
 
