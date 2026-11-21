@@ -1,6 +1,7 @@
 //! El cartel "Volvemos enseguida": un MPEG-TS pregrabado de 2 s (un keyframe y cuadros P casi vacíos,
 //! 1080p60, con los mismos parámetros que la PS5, y Opus en silencio) que se lee una vez al arrancar
-//! y se repite cuando no hay sesión. Lo genera `scripts/video/cartel.sh` del repo principal.
+//! y se repite cuando no hay sesión. Lo genera `scripts/video/cartel.sh` del repo principal. Su primer
+//! cuadro tiene que traer SPS, PPS y el IDR (si no, no se carga).
 
 use mpeg2ts::pes::{PesPacketReader, ReadPesPacket};
 use mpeg2ts::ts::TsPacketReader;
@@ -41,8 +42,13 @@ impl Cartel {
             }
         }
         let primero = video.first().ok_or("el cartel no tiene video")?;
-        if !partir_annexb(primero).iter().any(|n| tipo_nal(n) == Some(5)) {
+        let tipos: Vec<u8> = partir_annexb(primero).iter().filter_map(|n| tipo_nal(n)).collect();
+        if !tipos.contains(&5) {
             return Err("el cartel tiene que empezar con un keyframe".into());
+        }
+        // Al volver de la PS5, el decodificador necesita los parámetros del cartel en su primer cuadro.
+        if !tipos.contains(&7) || !tipos.contains(&8) {
+            return Err("el primer cuadro del cartel tiene que traer SPS y PPS (NAL 7 y 8)".into());
         }
         let pts: Option<Vec<u64>> = pts_video.into_iter().collect();
         let pts = pts.ok_or("cuadro de video sin PTS")?;
@@ -70,16 +76,23 @@ mod tests {
     use super::*;
     use crate::mux::Mux;
 
+    /// SPS + PPS + IDR, como el primer cuadro de un cartel de verdad.
+    const PRIMERO: [u8; 15] = [0, 0, 0, 1, 0x67, 0xCA, 0, 0, 0, 1, 0x68, 0xCA, 0, 0, 1];
+
+    fn primero() -> Vec<u8> {
+        [&PRIMERO[..], &[0x65, 0xCA]].concat()
+    }
+
     #[test]
     fn lee_un_cartel_escrito_por_el_mux() {
         let mut m = Mux::new(Vec::new());
-        m.video(&[0, 0, 0, 1, 0x65, 0xCA], 1000, true).unwrap();
+        m.video(&primero(), 1000, true).unwrap();
         m.video(&[0, 0, 0, 1, 0x41, 0xCA], 1000 + CUADRO, false).unwrap();
         for k in 0..4u64 {
             m.audio(&[0xF4, k as u8], 1000 + k * 900).unwrap(); // 10 ms cada uno
         }
         let c = Cartel::desde_ts(m.destino()).unwrap();
-        assert_eq!(c.video, vec![vec![0, 0, 0, 1, 0x65, 0xCA], vec![0, 0, 0, 1, 0x41, 0xCA]]);
+        assert_eq!(c.video, vec![primero(), vec![0, 0, 0, 1, 0x41, 0xCA]]);
         // La vuelta dura 2 cuadros (3000 marcas): el cuarto paquete (2700..3600) se pasaría y se descarta.
         assert_eq!(c.audio, vec![(0, vec![0xF4, 0]), (900, vec![0xF4, 1]), (1800, vec![0xF4, 2])]);
         assert_eq!(c.duracion(), 3000);
@@ -92,11 +105,29 @@ mod tests {
         assert!(Cartel::desde_ts(m.destino()).unwrap_err().contains("keyframe"));
     }
 
-    /// El cartel instalado en el servidor de video (si está): 120 cuadros, 2 s, Opus.
+    #[test]
+    fn rechaza_un_cartel_cuyo_keyframe_no_trae_sps_y_pps() {
+        // Al volver de la PS5 al cartel, el decodificador necesita los parámetros del cartel en su
+        // primer cuadro: sin ellos, el cartel se vería roto hasta el próximo cambio.
+        for (nombre, au) in [
+            ("sin SPS", vec![0, 0, 0, 1, 0x68, 0xCA, 0, 0, 0, 1, 0x65, 0xCA]),
+            ("sin PPS", vec![0, 0, 0, 1, 0x67, 0xCA, 0, 0, 0, 1, 0x65, 0xCA]),
+            ("sin ninguno", vec![0, 0, 0, 1, 0x65, 0xCA]),
+        ] {
+            let mut m = Mux::new(Vec::new());
+            m.video(&au, 1000, true).unwrap();
+            let e = Cartel::desde_ts(m.destino()).unwrap_err();
+            assert!(e.contains("SPS") && e.contains("PPS"), "{nombre}: {e}");
+        }
+    }
+
+    /// El cartel instalado en el servidor de video (si está; `MITURNO_CARTEL_TS` apunta a otra copia):
+    /// 120 cuadros, 2 s, Opus, un solo keyframe y con SPS y PPS en el primero.
     #[test]
     fn el_cartel_instalado_se_lee_bien() {
-        let Ok(ts) = std::fs::read("/var/lib/miturno-video/cartel.ts") else {
-            eprintln!("sin /var/lib/miturno-video/cartel.ts: no se prueba el cartel real");
+        let ruta = std::env::var("MITURNO_CARTEL_TS").unwrap_or_else(|_| "/var/lib/miturno-video/cartel.ts".into());
+        let Ok(ts) = std::fs::read(&ruta) else {
+            eprintln!("sin {ruta}: no se prueba el cartel real");
             return;
         };
         let c = Cartel::desde_ts(&ts).unwrap();
@@ -105,5 +136,7 @@ mod tests {
         assert_eq!(c.audio.len(), 100);
         let claves = c.video.iter().filter(|au| partir_annexb(au).iter().any(|n| tipo_nal(n) == Some(5))).count();
         assert_eq!(claves, 1);
+        let tipos: Vec<u8> = partir_annexb(&c.video[0]).iter().filter_map(|n| tipo_nal(n)).collect();
+        assert!(tipos.contains(&7) && tipos.contains(&8), "el primer cuadro trae SPS y PPS: {tipos:?}");
     }
 }
