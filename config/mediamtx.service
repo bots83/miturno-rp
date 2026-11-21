@@ -1,0 +1,40 @@
+# MediaMTX del servidor de video de MiTurno. Se instala en /etc/systemd/system/ con
+# scripts/video/desplegar-video.sh (repo principal). Binario oficial v1.21.3 en /usr/local/bin.
+[Unit]
+Description=MiTurno: MediaMTX (ruta ps5: WHEP por Caddy y RTSP local)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mediamtx
+Group=mediamtx
+ExecStart=/usr/local/bin/mediamtx /etc/mediamtx/mediamtx.yml
+WorkingDirectory=/
+Restart=always
+RestartSec=2
+LimitNOFILE=65536
+
+# Sin privilegios: no escribe en disco y no ve los procesos de otros usuarios (ProtectProc), así un
+# MediaMTX comprometido no puede leer la línea de comandos de kick-out.
+NoNewPrivileges=true
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectProc=invisible
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

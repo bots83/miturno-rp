@@ -12,7 +12,12 @@ Corre en el servidor de video de MiTurno. **Este repo no tiene secretos ni datos
 
 - `crates/rp-core`: lógica pura (credencial, mando, filtro por rol, "todo suelto", límite de keyframes, protocolo). Se prueba en cualquier máquina con `cargo test -p rp-core`.
 - `crates/miturno-rp`: el binario. Enlaza libchiaki (chiaki-ng v1.10.1).
-- `config/`: plantillas de configuración sin secretos.
+- `config/`: plantillas de configuración sin secretos, que instala el script de despliegue del servidor de video:
+  - `rp.toml` (miturno-rp) y `miturno-rp.service` (usuario `rp`, sin privilegios; cierre con SIGTERM);
+  - `mediamtx.yml` y `mediamtx.service` (MediaMTX v1.21.3: ruta `ps5` desde el MPEG-TS local, WHEP detrás de Caddy, RTSP y RTMP solo locales, autenticación por `/interno/auth`);
+  - `miturno-kick-out.service` (ffmpeg hacia Kick a 720p60; arranca apagado, el destino sale de `kick.env` o de `KICK_DESTINO`);
+  - `50-miturno-kick.rules` (polkit: el usuario `rp` solo puede arrancar, parar y reiniciar `miturno-kick-out.service`);
+  - `Caddyfile` (TLS, WHEP con CORS para `https://miturnolive.com`, `/ctl` y `/control/*`; lo demás, 404).
 - `scripts/`: herramientas del repo, incluido el chequeo de secretos que corre antes de cada push.
 
 ## Correr

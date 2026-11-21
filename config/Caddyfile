@@ -1,0 +1,73 @@
+# Caddy del servidor de video de MiTurno (paquete de Ubuntu 24.04). Plantilla sin secretos: se
+# instala en /etc/caddy/Caddyfile con scripts/video/desplegar-video.sh del repo principal.
+#
+# Certificado de Let's Encrypt para sp.miturnolive.com (el registro DNS no tiene proxy; desafío
+# HTTP-01 por el puerto 80). Rutas:
+# - /ps5/whep y /ps5/whep/<sesión> → MediaMTX (WHEP), con CORS solo para https://miturnolive.com;
+# - /ctl (WebSocket de los mandos) y /control/* (salud y acciones, con el token de la api) → miturno-rp;
+# - todo lo demás → 404. /interno/* de miturno-rp nunca pasa por acá.
+{
+	# La API de administración de Caddy queda solo local (es el valor por defecto; explícito).
+	admin localhost:2019
+	servers {
+		# Sin HTTP/3: el UDP 443 no está abierto en ufw.
+		protocols h1 h2
+	}
+}
+
+sp.miturnolive.com {
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		-Server
+	}
+	request_body {
+		max_size 1MB
+	}
+
+	# WHEP: POST (oferta SDP), PATCH (candidatos ICE), DELETE (cierre) y OPTIONS.
+	@whep {
+		path /ps5/whep /ps5/whep/*
+		method POST PATCH DELETE OPTIONS
+	}
+	handle @whep {
+		# CORS solo para el sitio. MediaMTX pone sus propios encabezados: se sacan y quedan estos.
+		@origen_miturno header Origin https://miturnolive.com
+		header @origen_miturno {
+			Access-Control-Allow-Origin https://miturnolive.com
+			Access-Control-Allow-Methods "OPTIONS, POST, PATCH, DELETE"
+			Access-Control-Allow-Headers "Authorization, Content-Type, If-Match"
+			Access-Control-Expose-Headers "Location, ETag, Link, Accept-Patch"
+			Access-Control-Max-Age 600
+		}
+		header Vary Origin
+
+		# Preflight del navegador: lo contesta Caddy (sin origen permitido, el navegador no sigue).
+		@preflight {
+			method OPTIONS
+			header Access-Control-Request-Method *
+		}
+		respond @preflight 204
+
+		reverse_proxy 127.0.0.1:8889 {
+			header_down -Access-Control-Allow-Origin
+			header_down -Access-Control-Allow-Methods
+			header_down -Access-Control-Allow-Headers
+			header_down -Access-Control-Expose-Headers
+			header_down -Access-Control-Allow-Credentials
+			header_down -Vary
+		}
+	}
+
+	# Mandos (WebSocket) y control de servidor a servidor.
+	handle /ctl {
+		reverse_proxy 127.0.0.1:7070
+	}
+	handle /control/* {
+		reverse_proxy 127.0.0.1:7070
+	}
+
+	handle {
+		respond 404
+	}
+}

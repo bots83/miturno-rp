@@ -1,0 +1,17 @@
+// MiTurno: miturno-rp (usuario rp) puede encender, apagar y reiniciar la salida a Kick, y ninguna
+// otra unidad ni ninguna otra operación de systemd. Se instala en /etc/polkit-1/rules.d/ con
+// scripts/video/desplegar-video.sh (repo principal). El nombre de la unidad es el mismo que usa
+// miturno-rp (UNIDAD_KICK en crates/miturno-rp/src/servidor.rs).
+polkit.addRule(function (action, subject) {
+  if (subject.user !== "rp") {
+    return polkit.Result.NOT_HANDLED;
+  }
+  if (action.id === "org.freedesktop.systemd1.manage-units") {
+    var unidad = action.lookup("unit");
+    var verbo = action.lookup("verb");
+    if (unidad === "miturno-kick-out.service" && (verbo === "start" || verbo === "stop" || verbo === "restart")) {
+      return polkit.Result.YES;
+    }
+  }
+  return polkit.Result.NO;
+});

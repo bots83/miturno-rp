@@ -1,0 +1,102 @@
+# MediaMTX v1.21.3 del servidor de video de MiTurno. Plantilla sin secretos: se instala en
+# /etc/mediamtx/mediamtx.yml (root:mediamtx 640) con scripts/video/desplegar-video.sh del repo principal.
+#
+# Lo único que se ve desde afuera es WebRTC: la señalización WHEP de la ruta ps5 pasa por Caddy
+# (HTTPS) y los medios van por UDP 8189. Todo lo demás escucha en 127.0.0.1 o está apagado.
+# Lo que no está en este archivo toma el valor por defecto de la v1.21.3.
+
+###############################################
+# General
+
+logLevel: info
+logDestinations: [stdout]
+readTimeout: 10s
+writeTimeout: 10s
+# Los IDR de la PS5 (1080p a 8 Mbps) llegan en ráfagas de cientos de KB por el UDP local de
+# miturno-rp; con el buffer por defecto del sistema (208 KB) se pierden pedazos del keyframe.
+# 8 MiB para cada socket UDP (la entrada de la ruta ps5 y el 8189 de WebRTC). MediaMTX no arranca
+# si el sistema no lo permite: net.core.rmem_max se sube a 16 MiB en /etc/sysctl.d/60-miturno-video.conf.
+udpReadBufferSize: 8388608
+
+###############################################
+# Autenticación: cada pedido lo decide miturno-rp (POST /interno/auth, solo 127.0.0.1).
+# - publish y read por RTSP o UDP desde la máquina: se permiten;
+# - read por WebRTC (WHEP) de ps5: con una credencial de turno válida de rol operador. MediaMTX la
+#   saca del encabezado "Authorization: Bearer <credencial>" y la manda en el campo "token" del JSON;
+# - todo lo demás: no.
+
+authMethod: http
+authHTTPAddress: http://127.0.0.1:7070/interno/auth
+authHTTPExclude:
+  # Ruta de la prueba de humo (Task 11): kick-out publica por RTMP y ffprobe lee por RTSP, los dos
+  # desde 127.0.0.1. No hace falta miturno-rp para eso. RTMP y RTSP solo escuchan en 127.0.0.1 y
+  # Caddy no lleva a esta ruta, así que nadie de afuera llega.
+  - action: publish
+    path: kick-humo
+  - action: read
+    path: kick-humo
+
+###############################################
+# Servidores que no se usan: apagados.
+
+api: false
+metrics: false
+pprof: false
+playback: false
+hls: false
+srt: false
+moq: false
+
+###############################################
+# RTSP: solo local, solo TCP (sin los puertos UDP 8000/8001 de RTP/RTCP abiertos a todas las
+# interfaces). Lo leen kick-out y, en F2, el vigilante de imagen.
+
+rtsp: true
+rtspTransports: [tcp]
+rtspEncryption: "no"
+rtspAddress: 127.0.0.1:8554
+
+###############################################
+# RTMP: solo local (la prueba de humo publica en kick-humo).
+
+rtmp: true
+rtmpEncryption: "no"
+rtmpAddress: 127.0.0.1:1935
+
+###############################################
+# WebRTC: la señalización HTTP queda detrás de Caddy (que pone el TLS y el CORS) y los medios
+# salen por UDP 8189 hacia la IP pública. Los servidores ICE (STUN y TURN propio) se los da la api
+# al navegador junto con la credencial; MediaMTX no anuncia ninguno.
+
+webrtc: true
+webrtcAddress: 127.0.0.1:8889
+webrtcEncryption: false
+# Caddy saca estos encabezados y pone los suyos, pero MediaMTX igual rechaza un POST de otro sitio
+# (Sec-Fetch-Site) si el origen no está acá.
+webrtcAllowOrigins: ["https://miturnolive.com"]
+# Caddy manda X-Forwarded-For: así la IP del cliente es la real en el registro y en la autenticación.
+webrtcTrustedProxies: ["127.0.0.1"]
+webrtcLocalUDPAddress: :8189
+webrtcLocalTCPAddress: ""
+# Solo la IP pública (sin las direcciones IPv6 ni las locales de la interfaz).
+webrtcIPsFromInterfaces: false
+webrtcAdditionalHosts: [172.237.53.111]
+webrtcICEServers2: []
+
+###############################################
+# Rutas. Las que no están acá no existen (no hay all_others).
+
+paths:
+  # Video y audio de la PS5 tal cual (H.264 + Opus, sin recomprimir): miturno-rp manda MPEG-TS por
+  # UDP a 127.0.0.1:9000, con el cartel cuando la sesión con la PS5 se corta, así la ruta nunca se
+  # queda sin video. MediaMTX escucha en esa dirección.
+  ps5:
+    source: udp+mpegts://127.0.0.1:9000
+    # La PS5 no manda keyframes sola: cada lector nuevo (WHEP, kick-out) pide uno, directo a
+    # miturno-rp (nunca por Caddy, que agrega X-Forwarded-For y miturno-rp lo rechaza). Todos pasan
+    # por el limitador único de 3 s.
+    runOnRead: /usr/bin/curl -s -o /dev/null --max-time 2 -X POST http://127.0.0.1:7070/interno/keyframe
+
+  # Receptor local de la prueba de humo (Task 11): reemplaza a Kick con KICK_DESTINO, sin tocar kick.env.
+  kick-humo:
+    source: publisher

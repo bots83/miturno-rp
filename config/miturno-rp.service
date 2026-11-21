@@ -1,0 +1,47 @@
+# miturno-rp: sesión Remote Play con la PS5, mandos (/ctl), autenticación de MediaMTX y control.
+# Se instala en /etc/systemd/system/ con scripts/video/desplegar-video.sh (repo principal).
+# Lee /etc/miturno-video/{rp.toml,casa.env,ps5.env,control.token,ct-public.pem} y el cartel de
+# /var/lib/miturno-video (root:rp 640); el resto de /etc/miturno-video (kick.env, telegram.env,
+# turn.secret) queda root 600 y no lo ve.
+[Unit]
+Description=MiTurno: miturno-rp (sesión con la PS5, mandos y control)
+After=network-online.target mediamtx.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rp
+Group=rp
+ExecStart=/usr/local/bin/miturno-rp --config /etc/miturno-video/rp.toml
+# Cierre limpio siempre: con SIGTERM llama a session.stop() (si muere sin eso, la PS5 rechaza la
+# próxima sesión un rato). Tiene hasta 10 s antes del SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=10
+Restart=always
+RestartSec=2
+RestartSteps=5
+RestartMaxDelaySec=30
+
+# Sin privilegios. Necesita red (PS5, MediaMTX, Caddy), D-Bus por AF_UNIX (systemctl de kick-out,
+# autorizado por la regla de polkit 50-miturno-kick.rules) y /proc/stat (CPU de la salud).
+NoNewPrivileges=true
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectProc=invisible
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
