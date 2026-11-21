@@ -72,6 +72,8 @@ struct Claims {
     #[serde(rename = "turnId")]
     turn_id: Option<String>,
     exp: u64,
+    /// Opcional (la api no lo emite): si viene, no puede estar más allá de la tolerancia.
+    nbf: Option<u64>,
     jti: String,
 }
 
@@ -116,7 +118,7 @@ pub fn validar(token: &str, clave_publica_pem: &str, ahora_s: u64) -> Result<Cre
     validar_con(token, &clave, ahora_s)
 }
 
-/// Valida firma (solo EdDSA), emisor, audiencia, vencimiento y rol. El tiempo es `ahora_s`, no el reloj
+/// Valida firma (solo EdDSA), emisor, audiencia, vencimiento, `nbf` (si viene) y rol. `iat` se ignora. El tiempo es `ahora_s`, no el reloj
 /// del sistema, para que sea determinista. La firma se chequea primero; recién después los claims.
 pub fn validar_con(token: &str, clave: &ClaveVerificacion, ahora_s: u64) -> Result<Credencial, ErrorCredencial> {
     let clave = &clave.0;
@@ -145,6 +147,10 @@ pub fn validar_con(token: &str, clave: &ClaveVerificacion, ahora_s: u64) -> Resu
     }
     if c.exp.saturating_add(TOLERANCIA_S) < ahora_s {
         return Err(ErrorCredencial::Vencida);
+    }
+    // Una credencial que todavía no vale no es de este contrato (la api no emite `nbf`).
+    if c.nbf.is_some_and(|nbf| nbf > ahora_s.saturating_add(TOLERANCIA_S)) {
+        return Err(ErrorCredencial::Formato);
     }
     let rol = match c.rol.as_str() {
         "operador" => Rol::Operador,
@@ -279,6 +285,84 @@ mod tests {
             c.as_object_mut().unwrap().remove(campo);
             assert_eq!(validar(&firmar(&sk, &c), &pk, AHORA), Err(ErrorCredencial::Formato), "{campo}");
         }
+    }
+
+    #[test]
+    fn falta_cualquier_claim_obligatorio_es_formato() {
+        let (sk, pk) = par(1);
+        for campo in ["iss", "aud", "exp", "rol", "sub", "jti"] {
+            let mut c = claims();
+            c.as_object_mut().unwrap().remove(campo);
+            assert_eq!(validar(&firmar(&sk, &c), &pk, AHORA), Err(ErrorCredencial::Formato), "{campo}");
+        }
+    }
+
+    /// base64url sin relleno (como en los JWT), sin sumar una dependencia solo para los tests.
+    fn b64(datos: &[u8]) -> String {
+        const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut s = String::new();
+        for t in datos.chunks(3) {
+            let n = t.iter().enumerate().fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
+            for i in 0..=t.len() {
+                s.push(A[(n >> (18 - 6 * i) & 63) as usize] as char);
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn b64_de_prueba_coincide_con_el_de_los_jwt() {
+        let t = firmar(&par(1).0, &claims());
+        let cabecera = t.split('.').next().unwrap();
+        assert_eq!(b64(br#"{"typ":"JWT","alg":"EdDSA"}"#), cabecera);
+    }
+
+    /// Cambia el payload de un token ya firmado (la firma queda la de antes).
+    fn con_payload(token: &str, payload: &Value) -> String {
+        let partes: Vec<&str> = token.split('.').collect();
+        format!("{}.{}.{}", partes[0], b64(payload.to_string().as_bytes()), partes[2])
+    }
+
+    #[test]
+    fn payload_adulterado_con_la_firma_de_otro_es_firma() {
+        let (sk, pk) = par(1);
+        let t = firmar(&sk, &claims());
+        let mut c = claims();
+        c["rol"] = json!("operador");
+        c["sub"] = json!("otro");
+        assert_eq!(validar(&con_payload(&t, &c), &pk, AHORA), Err(ErrorCredencial::Firma));
+    }
+
+    #[test]
+    fn alg_none_sin_firma_es_formato() {
+        let (_, pk) = par(1);
+        let cab = b64(json!({"alg":"none","typ":"JWT"}).to_string().as_bytes());
+        let cuerpo = b64(claims().to_string().as_bytes());
+        for t in [format!("{cab}.{cuerpo}."), format!("{cab}.{cuerpo}")] {
+            assert_eq!(validar(&t, &pk, AHORA), Err(ErrorCredencial::Formato), "{t}");
+        }
+    }
+
+    #[test]
+    fn el_borde_de_la_tolerancia_todavia_vale() {
+        let (sk, pk) = par(1);
+        let mut c = claims();
+        c["exp"] = json!(AHORA - 30);
+        assert!(validar(&firmar(&sk, &c), &pk, AHORA).is_ok(), "exp = ahora − 30 todavía vale");
+        c["exp"] = json!(AHORA - 30 - 1);
+        assert_eq!(validar(&firmar(&sk, &c), &pk, AHORA), Err(ErrorCredencial::Vencida));
+    }
+
+    #[test]
+    fn nbf_en_el_futuro_mas_alla_de_la_tolerancia_no_vale() {
+        let (sk, pk) = par(1);
+        let mut c = claims();
+        c["nbf"] = json!(AHORA + 30);
+        assert!(validar(&firmar(&sk, &c), &pk, AHORA).is_ok(), "nbf dentro de la tolerancia vale");
+        c["nbf"] = json!(AHORA + 31);
+        assert_eq!(validar(&firmar(&sk, &c), &pk, AHORA), Err(ErrorCredencial::Formato));
+        c["nbf"] = json!("mañana");
+        assert_eq!(validar(&firmar(&sk, &c), &pk, AHORA), Err(ErrorCredencial::Formato));
     }
 
     #[test]
