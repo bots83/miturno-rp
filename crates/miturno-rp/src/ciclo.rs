@@ -99,6 +99,12 @@ where
                         }
                     }
                     EventoSesion::Video { datos, perdidos } => {
+                        // libchiaki puede entregar el primer cuadro (el SPS/PPS) antes del aviso de
+                        // conectada: el video cuenta como conexión, así el encabezado no se pierde.
+                        if let Estado::Conectando { desde } = estado {
+                            crate::info!("ciclo: sesión conectada (intento {intento}, {} ms; llegó video)", (ahora - desde).as_millis());
+                            estado = Estado::Conectada { desde: ahora, ultimo_video: ahora };
+                        }
                         if let Estado::Conectada { ref mut ultimo_video, .. } = estado {
                             *ultimo_video = ahora;
                             salida.video_ps5(&datos, perdidos, t0.elapsed());
@@ -152,6 +158,12 @@ where
                     Estado::Conectando { .. } | Estado::Conectada { .. } => {
                         let que = if let Estado::Conectando { .. } = estado { "la PS5 no respondió" } else { "no llega video" };
                         crate::aviso!("ciclo: {que}; cierro el intento y reintento");
+                        // Igual que con Cerrada: si la sesión venía estable (un corte de Wi-Fi), se reintenta enseguida.
+                        if let Estado::Conectada { desde, .. } = estado {
+                            if Instant::now() - desde >= SESION_ESTABLE {
+                                espera = ESPERA_INICIAL;
+                            }
+                        }
                         // Se cierra en segundo plano para no frenar el cartel.
                         tokio::spawn(sesion.detener());
                         salida.sesion_caida(t0.elapsed());
@@ -367,6 +379,36 @@ mod tests {
         sleep(Duration::from_secs(5)).await;
         let t = b.segundos(&b.registro().conectar);
         assert_eq!(t, vec![0.0, 1.0, 3.0, 44.0, 46.0], "después de 40 s conectada, la espera vuelve a 1 s");
+        b.terminar().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn una_sesion_estable_que_se_queda_sin_video_reintenta_en_1_s() {
+        let red = || vec![EventoSesion::Cerrada { motivo: MotivoCierre::Red }];
+        let b = arrancar(vec![red(), red(), vec![EventoSesion::Conectada], vec![]]);
+        sleep(Duration::from_secs(3)).await; // intentos en 0, 1 y 3 s (la espera ya va en 4 s); el de 3 s conecta
+        let tx = b.emisor();
+        for _ in 0..8 {
+            sleep(Duration::from_secs(5)).await;
+            tx.send(video(vec![0, 0, 0, 1, 0x41, 0x50, 0])).await.unwrap();
+        }
+        // Último cuadro a los 43 s: a los 53 s se da por caída (sin Cerrada, como un corte de Wi-Fi).
+        sleep(Duration::from_secs(15)).await;
+        let t = b.segundos(&b.registro().conectar);
+        assert_eq!(t, vec![0.0, 1.0, 3.0, 54.0], "40 s conectada: la espera vuelve a 1 s también sin Cerrada");
+        b.terminar().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn el_encabezado_que_llega_antes_de_conectada_no_se_pierde() {
+        let sps_pps = vec![0, 0, 0, 1, 0x67, 0x50, 0x51, 0, 0, 1, 0x68, 0x52];
+        let idr = vec![0, 0, 0, 1, 0x65, 0x50, 1];
+        // libchiaki puede entregar el encabezado (SPS/PPS) antes del evento de conectada.
+        let b = arrancar(vec![vec![video(sps_pps.clone()), EventoSesion::Conectada, video(idr.clone())]]);
+        sleep(Duration::from_millis(100)).await;
+        let v = b.videos();
+        let primero = &v.iter().find(|c| c.1.contains(&0x50)).expect("salió la PS5").1;
+        assert_eq!(primero, &[sps_pps, idr].concat(), "el keyframe lleva el SPS/PPS de la PS5, no el del cartel");
         b.terminar().await;
     }
 

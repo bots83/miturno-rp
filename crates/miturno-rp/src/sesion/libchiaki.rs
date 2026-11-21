@@ -6,7 +6,7 @@
 //! maneja desde cualquier tarea), se reconecta sin reiniciar el proceso y los eventos salen por un canal.
 
 use std::borrow::Cow;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -27,6 +27,8 @@ enum Cmd {
     Despertar(Perfil),
     Conectar(Perfil),
     Detener(oneshot::Sender<()>),
+    /// Se soltó el último `SesionLibchiaki`: cerrar la sesión y terminar el hilo.
+    Fin(std_mpsc::SyncSender<()>),
     Mando(EstadoMando),
     Keyframe,
     Reposo,
@@ -43,19 +45,40 @@ pub struct SesionLibchiaki {
 
 impl SesionLibchiaki {
     pub fn new() -> Result<Self, String> {
-        libchiaki::lib_init().map_err(|e| format!("no pude iniciar libchiaki: {e}"))?;
+        Self::con_contador(Arc::default())
+    }
+
+    /// `cierres` cuenta las sesiones cerradas con `stop()` (lo leen los tests).
+    fn con_contador(cierres: Arc<AtomicUsize>) -> Result<Self, String> {
+        static INICIO: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+        INICIO
+            .get_or_init(|| libchiaki::lib_init().map_err(|e| format!("no pude iniciar libchiaki: {e}")))
+            .clone()?;
         let (cmd, rx_cmd) = std_mpsc::channel();
         let (tx_ev, rx_ev) = mpsc::channel(CAPACIDAD);
         let propio = cmd.clone();
+        let c = cierres.clone();
         std::thread::Builder::new()
             .name("sesion-ps5".into())
-            .spawn(move || hilo(rx_cmd, propio, tx_ev))
+            .spawn(move || hilo(rx_cmd, propio, tx_ev, c))
             .map_err(|e| format!("no pude crear el hilo de la sesión: {e}"))?;
         Ok(Self { cmd, eventos: Mutex::new(Some(rx_ev)) })
     }
 
     fn mandar(&self, c: Cmd) -> Result<(), ErrorSesion> {
         self.cmd.send(c).map_err(|_| ErrorSesion::HiloTerminado)
+    }
+}
+
+/// Al soltar el último handle (fin normal, o un pánico que desenrolla la tarea dueña) la sesión se
+/// cierra con `stop()` antes de seguir: si no, la PS5 rechaza la próxima con "Remote is already in use".
+/// El hilo guarda su propio `Sender` (para los callbacks), así que sin este aviso nunca terminaría.
+impl Drop for SesionLibchiaki {
+    fn drop(&mut self) {
+        let (listo, esperar) = std_mpsc::sync_channel(1);
+        if self.cmd.send(Cmd::Fin(listo)).is_ok() && esperar.recv_timeout(Duration::from_secs(4)).is_err() {
+            crate::aviso!("sesión: el cierre al salir no terminó en 4 s");
+        }
     }
 }
 
@@ -289,7 +312,7 @@ fn abrir<'a>(
 }
 
 /// Cierre limpio: `stop()` y espera al hilo de libchiaki. Sin esto, la PS5 rechaza la sesión siguiente.
-fn cerrar(activa: &mut Option<Activa<'_>>) {
+fn cerrar(activa: &mut Option<Activa<'_>>, cierres: &AtomicUsize) {
     if let Some(mut a) = activa.take() {
         a.a_pedido.store(true, Ordering::SeqCst);
         if let Err(e) = a.sesion.stop() {
@@ -298,11 +321,12 @@ fn cerrar(activa: &mut Option<Activa<'_>>) {
         if let Err(e) = a.sesion.join() {
             crate::aviso!("sesión: join() falló: {e}");
         }
+        cierres.fetch_add(1, Ordering::SeqCst);
         crate::info!("sesión: cerrada con stop()");
     }
 }
 
-fn hilo(rx: std_mpsc::Receiver<Cmd>, propio: std_mpsc::Sender<Cmd>, ev: mpsc::Sender<EventoSesion>) {
+fn hilo(rx: std_mpsc::Receiver<Cmd>, propio: std_mpsc::Sender<Cmd>, ev: mpsc::Sender<EventoSesion>, cierres: Arc<AtomicUsize>) {
     let log = nuevo_log();
     let mut activa: Option<Activa<'_>> = None;
     let mut numero = 0u64;
@@ -320,7 +344,7 @@ fn hilo(rx: std_mpsc::Receiver<Cmd>, propio: std_mpsc::Sender<Cmd>, ev: mpsc::Se
             }
             Cmd::Conectar(p) => {
                 registrar_privado(&p);
-                cerrar(&mut activa);
+                cerrar(&mut activa, &cierres);
                 numero += 1;
                 match abrir(&log, &p, numero, &ev, &propio) {
                     Ok(a) => activa = Some(a),
@@ -331,8 +355,13 @@ fn hilo(rx: std_mpsc::Receiver<Cmd>, propio: std_mpsc::Sender<Cmd>, ev: mpsc::Se
                 }
             }
             Cmd::Detener(listo) => {
-                cerrar(&mut activa);
+                cerrar(&mut activa, &cierres);
                 let _ = listo.send(());
+            }
+            Cmd::Fin(listo) => {
+                cerrar(&mut activa, &cierres);
+                let _ = listo.send(());
+                return;
             }
             Cmd::Mando(e) => {
                 if let Some(a) = activa.as_mut() {
@@ -375,19 +404,73 @@ fn hilo(rx: std_mpsc::Receiver<Cmd>, propio: std_mpsc::Sender<Cmd>, ev: mpsc::Se
             Cmd::PidePin(n) => {
                 if activa.as_ref().is_some_and(|a| a.numero == n) {
                     crate::falla!("sesión: la PS5 pide el PIN de inicio de sesión; hay que desactivarlo en la consola");
-                    cerrar(&mut activa);
+                    cerrar(&mut activa, &cierres);
                     avisar(&ev, EventoSesion::Cerrada { motivo: MotivoCierre::Otro });
                 }
             }
         }
     }
-    // Se soltó el último `SesionLibchiaki`: si quedó una sesión, se cierra limpio igual.
-    cerrar(&mut activa);
+    // No debería llegar acá (el hilo tiene su propio Sender), pero si llega, se cierra limpio igual.
+    cerrar(&mut activa, &cierres);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sesion::ConLimite;
+
+    /// Una dirección de documentación (RFC 5737) que no responde: la sesión queda intentando conectar
+    /// varios segundos, así hay una sesión abierta que cerrar.
+    fn perfil_inalcanzable() -> Perfil {
+        Perfil {
+            host: "192.0.2.1".into(),
+            regist_key: *b"a1b2c3d4\0\0\0\0\0\0\0\0",
+            morning: [0; 16],
+            account_id: [0; 8],
+            bitrate_kbps: 8000,
+        }
+    }
+
+    #[test]
+    fn soltar_el_ultimo_handle_cierra_la_sesion_una_vez() {
+        let cierres = Arc::new(AtomicUsize::new(0));
+        let s = SesionLibchiaki::con_contador(cierres.clone()).unwrap();
+        s.conectar(&perfil_inalcanzable()).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        drop(s);
+        assert_eq!(cierres.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn un_panico_en_la_tarea_duena_cierra_la_sesion_antes_de_salir() {
+        let cierres = Arc::new(AtomicUsize::new(0));
+        let c = cierres.clone();
+        let r = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async move {
+                let s = Arc::new(ConLimite::new(SesionLibchiaki::con_contador(c).unwrap(), 3_000));
+                s.conectar(&perfil_inalcanzable()).unwrap();
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                panic!("prueba: pánico en el ciclo");
+            })
+        })
+        .join();
+        assert!(r.is_err(), "la tarea tenía que entrar en pánico");
+        assert_eq!(cierres.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn detener_y_despues_soltar_cierra_una_sola_vez() {
+        let cierres = Arc::new(AtomicUsize::new(0));
+        let s = SesionLibchiaki::con_contador(cierres.clone()).unwrap();
+        s.conectar(&perfil_inalcanzable()).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(s.detener());
+        assert_eq!(cierres.load(Ordering::SeqCst), 1);
+        drop(s);
+        assert_eq!(cierres.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn cada_boton_va_a_su_boton_de_libchiaki() {

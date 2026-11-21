@@ -7,3 +7,11 @@ version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 repository = "https://github.com/bots83/miturno-rp"
+
+# El cierre limpio de la sesión con la PS5 ante un pánico depende de que se desenrolle (Drop de
+# SesionLibchiaki): nunca "abort".
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
