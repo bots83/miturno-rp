@@ -5,8 +5,13 @@
 //! - `EnUso` ("Remote is already in use"): 3 s fijos y sin despertar. La PS5 está despierta y todavía
 //!   tiene la sesión anterior; la rechaza en el pedido HTTP inicial (antes de abrir el control o el
 //!   video), así que reintentar seguido no le cuesta nada (el cliente de chiaki-ng reintenta cada pocos ms).
+//!   Después de `EN_USO_ANTES_DE_ESPACIAR` seguidos (unos 2 min), cada 15 s: si la PS5 quedó trabada con
+//!   otra sesión, cada intento son varias líneas de registro y a 3 s llenaría el journal.
 //! - `Otra` (lo que no se arregla solo: versión, PIN, Remote Play caído en la consola, el hilo de
 //!   libchiaki muerto): 1, 2, 4, 8, 16 y después 30 s, para no martillar algo que necesita una persona.
+//!
+//! `Red` y `Otra` tienen cada una su escalón: muchas `Red` seguidas no hacen esperar 30 s al primer
+//! `Otra`, y muchas `Otra` no suben la espera de la red.
 
 use std::time::Duration;
 
@@ -15,6 +20,10 @@ pub const ESPERA_INICIAL: Duration = Duration::from_secs(1);
 pub const ESPERA_MAXIMA: Duration = Duration::from_secs(5);
 /// Fija con `EnUso`.
 pub const ESPERA_EN_USO: Duration = Duration::from_secs(3);
+/// Con `EnUso` después de `EN_USO_ANTES_DE_ESPACIAR` seguidos.
+pub const ESPERA_EN_USO_ESPACIADA: Duration = Duration::from_secs(15);
+/// Cuántos `EnUso` seguidos se reintentan cada 3 s (40 × 3 s = 2 min, más lo que tarda cada intento).
+pub const EN_USO_ANTES_DE_ESPACIAR: u32 = 40;
 /// Tope con `Otra`.
 pub const ESPERA_MAXIMA_OTRA: Duration = Duration::from_secs(30);
 
@@ -33,10 +42,13 @@ pub struct Espera {
     pub despertar: bool,
 }
 
-/// El backoff: un solo escalón que crece con `Red` y con `Otra` (cada una con su tope). `EnUso` no lo mueve.
+/// El backoff: un escalón para `Red` y otro para `Otra` (cada uno con su tope) y la racha de `EnUso`
+/// seguidos. `EnUso` no mueve los escalones; `Red` y `Otra` cortan la racha.
 #[derive(Debug, Clone)]
 pub struct Reintentos {
-    siguiente: Duration,
+    red: Duration,
+    otra: Duration,
+    en_uso_seguidos: u32,
 }
 
 impl Default for Reintentos {
@@ -47,23 +59,33 @@ impl Default for Reintentos {
 
 impl Reintentos {
     pub fn new() -> Self {
-        Self { siguiente: ESPERA_INICIAL }
+        Self { red: ESPERA_INICIAL, otra: ESPERA_INICIAL, en_uso_seguidos: 0 }
     }
 
-    /// Vuelve la espera a 1 s (sesión estable o reintento pedido a mano).
+    /// Vuelve las esperas a 1 s y corta la racha de `EnUso` (sesión estable o reintento pedido a mano).
     pub fn reiniciar(&mut self) {
-        self.siguiente = ESPERA_INICIAL;
+        *self = Self::new();
     }
 
-    /// La espera para el próximo intento; con `Red` y `Otra`, avanza el escalón.
+    /// Si los `EnUso` seguidos ya pasaron a la espera larga (el ciclo registra menos).
+    pub fn en_uso_espaciado(&self) -> bool {
+        self.en_uso_seguidos > EN_USO_ANTES_DE_ESPACIAR
+    }
+
+    /// La espera para el próximo intento; con `Red` y `Otra`, avanza su escalón.
     pub fn proxima(&mut self, causa: Causa) -> Espera {
-        let tope = match causa {
-            Causa::EnUso => return Espera { dura: ESPERA_EN_USO, despertar: false },
-            Causa::Red => ESPERA_MAXIMA,
-            Causa::Otra => ESPERA_MAXIMA_OTRA,
+        let (escalon, tope) = match causa {
+            Causa::EnUso => {
+                self.en_uso_seguidos = self.en_uso_seguidos.saturating_add(1);
+                let dura = if self.en_uso_espaciado() { ESPERA_EN_USO_ESPACIADA } else { ESPERA_EN_USO };
+                return Espera { dura, despertar: false };
+            }
+            Causa::Red => (&mut self.red, ESPERA_MAXIMA),
+            Causa::Otra => (&mut self.otra, ESPERA_MAXIMA_OTRA),
         };
-        let dura = self.siguiente.min(tope);
-        self.siguiente = (self.siguiente * 2).min(ESPERA_MAXIMA_OTRA);
+        let dura = (*escalon).min(tope);
+        *escalon = (*escalon * 2).min(tope);
+        self.en_uso_seguidos = 0;
         Espera { dura, despertar: true }
     }
 }
@@ -110,11 +132,46 @@ mod tests {
     }
 
     #[test]
-    fn despues_de_varias_otra_la_red_igual_tiene_tope_de_5_s() {
+    fn cada_causa_tiene_su_escalon() {
         let mut r = Reintentos::new();
         esperas(&mut r, Causa::Otra, 7);
-        assert_eq!(esperas(&mut r, Causa::Red, 2), vec![5, 5]);
+        assert_eq!(esperas(&mut r, Causa::Red, 3), vec![1, 2, 4], "la red no hereda el escalón de Otra");
         assert_eq!(esperas(&mut r, Causa::Otra, 1), vec![30], "y la otra sigue en su tope");
+    }
+
+    #[test]
+    fn despues_de_muchas_red_otra_arranca_en_1_s() {
+        let mut r = Reintentos::new();
+        esperas(&mut r, Causa::Red, 20);
+        assert_eq!(esperas(&mut r, Causa::Otra, 3), vec![1, 2, 4], "un Otra no espera 30 s de entrada");
+        assert_eq!(esperas(&mut r, Causa::Red, 1), vec![5], "y la red sigue en su tope");
+    }
+
+    #[test]
+    fn en_uso_seguido_se_espacia_despues_de_2_minutos() {
+        let mut r = Reintentos::new();
+        let t = esperas(&mut r, Causa::EnUso, EN_USO_ANTES_DE_ESPACIAR as usize);
+        assert!(t.iter().all(|&s| s == 3), "{t:?}");
+        assert!(EN_USO_ANTES_DE_ESPACIAR as u64 * ESPERA_EN_USO.as_secs() >= 120, "al menos 2 min de 3 s");
+        assert!(!r.en_uso_espaciado());
+        for _ in 0..50 {
+            assert_eq!(r.proxima(Causa::EnUso), Espera { dura: ESPERA_EN_USO_ESPACIADA, despertar: false });
+        }
+        assert!(r.en_uso_espaciado());
+        assert_eq!(ESPERA_EN_USO_ESPACIADA, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn otra_causa_o_reiniciar_cortan_la_racha_de_en_uso() {
+        let mut r = Reintentos::new();
+        esperas(&mut r, Causa::EnUso, 60);
+        assert!(r.en_uso_espaciado());
+        esperas(&mut r, Causa::Red, 1);
+        assert!(!r.en_uso_espaciado());
+        assert_eq!(esperas(&mut r, Causa::EnUso, 1), vec![3], "la racha vuelve a empezar");
+        esperas(&mut r, Causa::EnUso, 60);
+        r.reiniciar();
+        assert_eq!(esperas(&mut r, Causa::EnUso, 1), vec![3]);
     }
 
     #[test]
