@@ -2,7 +2,7 @@
 
 use jsonwebtoken::errors::ErrorKind;
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const EMISOR: &str = "miturno";
 const AUDIENCIA: &str = "miturno-video";
@@ -10,7 +10,8 @@ const AUDIENCIA: &str = "miturno-video";
 const TOLERANCIA_S: u64 = 30;
 
 /// Rol de la conexión. El orden importa: `Operador > Jugador > Vista`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Rol {
     Vista,
     Jugador,
