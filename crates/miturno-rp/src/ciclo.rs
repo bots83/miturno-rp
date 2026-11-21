@@ -353,7 +353,7 @@ mod tests {
         let tarea = tokio::spawn(correr(
             sesion.clone(),
             perfil(),
-            Salida::new(cartel_de_prueba(), salida.clone()),
+            Salida::new(cartel_de_prueba(), salida.clone(), crate::salida::tests::ORIGEN_PRUEBA),
             async move {
                 let _ = rx.await;
             },

@@ -7,15 +7,19 @@
 //!
 //! Las marcas de tiempo (PTS) siguen un reloj monótono que pasa quien llama (`ahora`, desde el arranque)
 //! y nunca retroceden, tampoco en los cambios; así Kick y los reproductores nunca ven un corte.
+//! El origen se toma una sola vez al arrancar, de la hora del sistema (`origen_de`): si miturno-rp se
+//! reinicia con Kick al aire, las marcas siguen hacia adelante en vez de volver a empezar (con un origen
+//! fijo saltaban hacia atrás y Kick quedaba congelado varios segundos). Adentro todo es u64 sin recortar;
+//! el mux recorta PTS y PCR a 33 bits, así que la vuelta de los 33 bits (~26,5 h) pasa sin saltos.
 
 use std::borrow::Cow;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::cartel::Cartel;
 use crate::mux::{duracion_opus, partir_annexb, tipo_nal, Destino, Mux, CUADRO, HZ};
 
-/// Las marcas arrancan en 1 s (margen para el PCR y para no empezar en 0).
-const ORIGEN: u64 = HZ;
+/// Largo del reloj de MPEG-TS: PTS y PCR son de 33 bits.
+const VUELTA_33: u64 = 1 << 33;
 /// Sin video de la PS5 por este tiempo, se vuelve al cartel.
 pub const PS5_TRABADA: Duration = Duration::from_millis(1_500);
 /// Si el cartel se atrasó más que esto (el proceso estuvo trabado), reempieza la vuelta en vez de
@@ -26,15 +30,15 @@ const ATRASO_CARTEL: u64 = HZ / 2;
 const BANDA: u64 = HZ / 20;
 const LEJOS: u64 = HZ / 2;
 
-/// Marca de 90 kHz para un instante (desde el arranque de la salida).
-fn marcas(ahora: Duration) -> u64 {
-    ORIGEN + (ahora.as_nanos() * 9 / 100_000) as u64
+/// Origen de las marcas para un arranque en `t`: la hora del sistema en marcas de 90 kHz, en 33 bits.
+pub fn origen_de(t: SystemTime) -> u64 {
+    let desde_1970 = t.duration_since(UNIX_EPOCH).unwrap_or_default();
+    (desde_1970.as_nanos() * 9 / 100_000) as u64 & (VUELTA_33 - 1)
 }
 
-/// El primer instante en el que `marcas(instante) >= marca`.
-fn instante(marca: u64) -> Duration {
-    let nanos = (marca.saturating_sub(ORIGEN) as u128 * 100_000).div_ceil(9);
-    Duration::from_nanos(nanos as u64)
+/// Origen de las marcas para un arranque ahora.
+pub fn origen_del_reloj() -> u64 {
+    origen_de(SystemTime::now())
 }
 
 /// Siguiente marca de una cuenta (`esperada`) corregida contra el reloj (`reloj`), sin bajar de `minima`.
@@ -62,6 +66,8 @@ enum Modo {
 
 pub struct Salida<D: Destino> {
     mux: Mux<D>,
+    /// Marca que corresponde a `ahora = 0` (ver `origen_de`).
+    origen: u64,
     cartel: Cartel,
     modo: Modo,
     /// Próximas marcas esperadas (último + duración). Ninguna marca nueva baja de acá: así nunca retroceden.
@@ -74,13 +80,15 @@ pub struct Salida<D: Destino> {
 }
 
 impl<D: Destino> Salida<D> {
-    /// Arranca mostrando el cartel desde `ahora = 0`.
-    pub fn new(cartel: Cartel, destino: D) -> Self {
+    /// Arranca mostrando el cartel desde `ahora = 0`, que en las marcas es `origen` (en producción,
+    /// `origen_del_reloj()`).
+    pub fn new(cartel: Cartel, destino: D, origen: u64) -> Self {
         assert!(!cartel.video.is_empty(), "cartel sin video");
         Self {
             mux: Mux::new(destino),
+            origen,
             cartel,
-            modo: Modo::Cartel { base: ORIGEN, v: 0, a: 0 },
+            modo: Modo::Cartel { base: origen, v: 0, a: 0 },
             v_sig: 0,
             a_sig: 0,
             dur_audio_ps5: 480 * HZ / 48_000,
@@ -92,8 +100,19 @@ impl<D: Destino> Salida<D> {
         self.mux.destino()
     }
 
+    /// Marca de 90 kHz para un instante (desde el arranque de la salida).
+    fn marcas(&self, ahora: Duration) -> u64 {
+        self.origen + (ahora.as_nanos() * 9 / 100_000) as u64
+    }
+
+    /// El primer instante en el que `marcas(instante) >= marca`.
+    fn instante(&self, marca: u64) -> Duration {
+        let nanos = (marca.saturating_sub(self.origen) as u128 * 100_000).div_ceil(9);
+        Duration::from_nanos(nanos as u64)
+    }
+
     fn a_cartel(&mut self, ahora: Duration) {
-        let base = marcas(ahora).max(self.v_sig).max(self.a_sig);
+        let base = self.marcas(ahora).max(self.v_sig).max(self.a_sig);
         self.modo = Modo::Cartel { base, v: 0, a: 0 };
     }
 
@@ -113,7 +132,7 @@ impl<D: Destino> Salida<D> {
             crate::aviso!("salida: la PS5 no manda video hace {:?}; vuelve el cartel", PS5_TRABADA);
             self.a_cartel(ahora);
         }
-        let reloj = marcas(ahora);
+        let reloj = self.marcas(ahora);
         if let Modo::Cartel { base, v, .. } = self.modo {
             if base + v * CUADRO + ATRASO_CARTEL < reloj {
                 self.a_cartel(ahora);
@@ -146,7 +165,7 @@ impl<D: Destino> Salida<D> {
         match self.modo {
             Modo::Cartel { base, v, a } => {
                 let (pv, pa) = self.proximas_del_cartel(base, v, a);
-                instante(pv.min(pa))
+                self.instante(pv.min(pa))
             }
             Modo::Ps5 { ultimo_video, .. } => ultimo_video + PS5_TRABADA,
         }
@@ -175,7 +194,7 @@ impl<D: Destino> Salida<D> {
         if !vcl {
             return;
         }
-        let reloj = marcas(ahora);
+        let reloj = self.marcas(ahora);
         let pts = match self.modo {
             Modo::Cartel { .. } => {
                 if !clave {
@@ -213,7 +232,7 @@ impl<D: Destino> Salida<D> {
             return;
         }
         let dur = duracion_opus(opus).unwrap_or(self.dur_audio_ps5);
-        let reloj = marcas(ahora);
+        let reloj = self.marcas(ahora);
         let pts = if audio_nuevo {
             reloj.max(self.a_sig)
         } else {
@@ -312,9 +331,69 @@ pub mod tests {
         pts.windows(2).all(|w| w[1] > w[0])
     }
 
+    /// Origen de las pruebas: 1 s, como antes de tomarlo de la hora del sistema.
+    pub const ORIGEN_PRUEBA: u64 = HZ;
+    const VUELTA: u64 = 1 << 33;
+
+    #[test]
+    fn el_origen_sale_de_la_hora_del_sistema_en_33_bits() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        assert_eq!(origen_de(UNIX_EPOCH + Duration::from_secs(1)), HZ);
+        assert_eq!(origen_de(UNIX_EPOCH + Duration::from_millis(1_500)), HZ + HZ / 2);
+        // 2^33 marcas son ~26,5 h: a las 2^33 + 7 marcas desde 1970 da 7.
+        let t = UNIX_EPOCH + Duration::from_nanos((VUELTA + 7) * 100_000 / 9 + 1);
+        assert_eq!(origen_de(t), 7);
+        // Dos arranques seguidos dan orígenes crecientes (salvo justo en la vuelta, cada ~26,5 h).
+        let a = origen_de(SystemTime::now());
+        let b = origen_de(SystemTime::now() + Duration::from_secs(5));
+        assert!(b.wrapping_sub(a) % VUELTA >= 5 * HZ - 1 && a < VUELTA && b < VUELTA, "{a} → {b}");
+    }
+
+    #[test]
+    fn las_marcas_arrancan_en_el_origen_que_se_pasa() {
+        let mut s = Salida::new(cartel_de_prueba(), Vec::new(), 123_456_789);
+        s.tick(ms(0));
+        s.tick(ms(20));
+        let v = videos(&s);
+        assert_eq!(v[0].0, 123_456_789);
+        assert_eq!(audios(&s)[0].0, 123_456_789);
+        assert_eq!(s.proximo(), Duration::from_nanos((2 * CUADRO * 100_000).div_ceil(9)));
+    }
+
+    #[test]
+    fn a_un_segundo_de_la_vuelta_de_33_bits_las_marcas_siguen_creciendo_modulo_2_33() {
+        let mut s = Salida::new(cartel_de_prueba(), Vec::new(), VUELTA - HZ);
+        ticks(&mut s, 0, 500);
+        s.video_ps5(&SPS_PPS, 0, ms(500));
+        s.video_ps5(&idr_ps5(0), 0, ms(500));
+        for k in 1..100u64 {
+            s.tick(ms(500 + k * 16));
+            s.video_ps5(&p_ps5(k as u8), 0, ms(500 + k * 16));
+            s.audio_ps5(&[0xF4, 0x50], ms(500 + k * 16));
+        }
+        s.sesion_caida(ms(2_100));
+        ticks(&mut s, 2_100, 2_500);
+        let mod_crecientes = |pts: &[u64]| {
+            pts.iter().all(|&p| p < VUELTA)
+                && pts.windows(2).all(|w| {
+                    // Un retroceso daría casi 2^33; los saltos hacia adelante de `ajustar` son de menos de 1 s.
+                    let d = w[1].wrapping_sub(w[0]) % VUELTA;
+                    d > 0 && d < HZ
+                })
+        };
+        let v: Vec<u64> = videos(&s).iter().map(|c| c.0).collect();
+        let a: Vec<u64> = audios(&s).iter().map(|c| c.0).collect();
+        assert!(v.first().unwrap() > &(VUELTA - HZ - 1) && v.last().unwrap() < &(2 * HZ), "pasó la vuelta: {v:?}");
+        assert!(a.last().unwrap() < &(2 * HZ), "el audio también pasó la vuelta");
+        assert!(mod_crecientes(&v), "video: {v:?}");
+        assert!(mod_crecientes(&a), "audio: {a:?}");
+        let f: Vec<Fuente> = videos(&s).iter().map(|c| c.1).collect();
+        assert!(f.contains(&Fuente::Ps5) && f.last() == Some(&Fuente::Cartel));
+    }
+
     #[test]
     fn sin_sesion_emite_el_cartel_en_bucle_con_pts_crecientes() {
-        let mut s = Salida::new(cartel_de_prueba(), Vec::new());
+        let mut s = Salida::new(cartel_de_prueba(), Vec::new(), ORIGEN_PRUEBA);
         assert!(s.en_cartel());
         ticks(&mut s, 0, 200);
         let v = videos(&s);
@@ -335,7 +414,7 @@ pub mod tests {
 
     #[test]
     fn el_cartel_arranca_enseguida_y_proximo_avisa_cuando_toca() {
-        let mut s = Salida::new(cartel_de_prueba(), Vec::new());
+        let mut s = Salida::new(cartel_de_prueba(), Vec::new(), ORIGEN_PRUEBA);
         assert_eq!(s.proximo(), Duration::ZERO);
         s.tick(Duration::ZERO);
         assert_eq!(videos(&s).len(), 1);
@@ -344,7 +423,7 @@ pub mod tests {
 
     #[test]
     fn video_de_la_ps5_sin_keyframe_sigue_el_cartel() {
-        let mut s = Salida::new(cartel_de_prueba(), Vec::new());
+        let mut s = Salida::new(cartel_de_prueba(), Vec::new(), ORIGEN_PRUEBA);
         ticks(&mut s, 0, 100);
         for k in 0..5u64 {
             s.video_ps5(&p_ps5(k as u8), 0, ms(100 + k * 16));
@@ -359,7 +438,7 @@ pub mod tests {
 
     #[test]
     fn al_llegar_el_keyframe_cambia_a_la_ps5() {
-        let mut s = Salida::new(cartel_de_prueba(), Vec::new());
+        let mut s = Salida::new(cartel_de_prueba(), Vec::new(), ORIGEN_PRUEBA);
         ticks(&mut s, 0, 100);
         s.video_ps5(&SPS_PPS, 0, ms(100)); // solo parámetros: se guardan, no salen
         s.video_ps5(&p_ps5(0), 0, ms(101));
@@ -380,7 +459,7 @@ pub mod tests {
 
     #[test]
     fn el_keyframe_sin_parametros_lleva_los_guardados() {
-        let mut s = Salida::new(cartel_de_prueba(), Vec::new());
+        let mut s = Salida::new(cartel_de_prueba(), Vec::new(), ORIGEN_PRUEBA);
         s.tick(ms(0));
         s.video_ps5(&SPS_PPS, 0, ms(5));
         s.video_ps5(&idr_ps5(1), 0, ms(10));
@@ -393,7 +472,7 @@ pub mod tests {
 
     #[test]
     fn los_pts_nunca_retroceden_en_los_dos_cambios() {
-        let mut s = Salida::new(cartel_de_prueba(), Vec::new());
+        let mut s = Salida::new(cartel_de_prueba(), Vec::new(), ORIGEN_PRUEBA);
         ticks(&mut s, 0, 50);
         // La PS5 llega "adelantada" (cuenta cuadros perdidos) y después se cae.
         s.video_ps5(&idr_ps5(0), 0, ms(50));
@@ -427,7 +506,7 @@ pub mod tests {
 
     #[test]
     fn el_audio_no_se_superpone_al_volver_al_cartel() {
-        let mut s = Salida::new(cartel_de_prueba(), Vec::new());
+        let mut s = Salida::new(cartel_de_prueba(), Vec::new(), ORIGEN_PRUEBA);
         s.tick(ms(0));
         s.video_ps5(&idr_ps5(0), 0, ms(1));
         for k in 0..20u64 {
@@ -443,7 +522,7 @@ pub mod tests {
 
     #[test]
     fn si_la_ps5_deja_de_mandar_video_vuelve_al_cartel() {
-        let mut s = Salida::new(cartel_de_prueba(), Vec::new());
+        let mut s = Salida::new(cartel_de_prueba(), Vec::new(), ORIGEN_PRUEBA);
         s.tick(ms(0));
         s.video_ps5(&idr_ps5(0), 0, ms(10));
         assert!(!s.en_cartel());
@@ -457,7 +536,7 @@ pub mod tests {
 
     #[test]
     fn si_se_atrasa_mucho_el_cartel_reempieza_sin_rafagas() {
-        let mut s = Salida::new(cartel_de_prueba(), Vec::new());
+        let mut s = Salida::new(cartel_de_prueba(), Vec::new(), ORIGEN_PRUEBA);
         s.tick(ms(0));
         s.tick(ms(5_000)); // el proceso estuvo trabado 5 s
         let v = videos(&s);

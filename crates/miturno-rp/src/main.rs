@@ -10,7 +10,7 @@ use miturno_rp::cartel::Cartel;
 use miturno_rp::config::{self, Argumentos, Rutas};
 use miturno_rp::metricas::Metricas;
 use miturno_rp::mux::DestinoUdp;
-use miturno_rp::salida::Salida;
+use miturno_rp::salida::{self, Salida};
 use miturno_rp::servidor::{self, EstadoServidor, Piezas};
 use miturno_rp::sesion::libchiaki::SesionLibchiaki;
 use miturno_rp::sesion::{ConLimite, MIN_ENTRE_KEYFRAMES_MS};
@@ -88,7 +88,7 @@ fn correr(rutas: Rutas) -> Result<(), String> {
             cartel.video.len(),
             config.bitrate_kbps
         );
-        ciclo::correr(sesion, perfil, Salida::new(cartel, destino), senales, enlace).await;
+        ciclo::correr(sesion, perfil, Salida::new(cartel, destino, salida::origen_del_reloj()), senales, enlace).await;
         info!("miturno-rp: listo");
         Ok(())
     })
