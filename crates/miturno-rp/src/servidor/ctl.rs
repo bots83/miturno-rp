@@ -1,7 +1,8 @@
 //! `GET /ctl`: el WebSocket de los mandos.
 //!
 //! - El primer mensaje tiene que ser `auth` en menos de 2 s; si no, `error FORMATO` y se cierra.
-//!   Como mucho `MAX_SIN_AUTH` conexiones esperan `auth` a la vez: las demás reciben 503 sin upgrade.
+//!   Como mucho `MAX_SIN_AUTH` conexiones esperan `auth` a la vez, y `MAX_SIN_AUTH_POR_IP` de una
+//!   misma IP (la del cliente que pasa Caddy en `X-Forwarded-For`): las demás reciben 503 sin upgrade.
 //! - Un solo controlador a la vez: una conexión válida de rol igual o mayor reemplaza a la anterior
 //!   (que recibe `reemplazado` y se cierra); una de rol menor recibe `error OCUPADO`.
 //! - Cada mensaje válido es un latido. Con 500 ms de silencio se suelta todo (la conexión sigue); al
@@ -17,16 +18,18 @@
 //! La ranura la libera un guardián (`Dueno`) al soltarse: también si la tarea entra en pánico o se
 //! cancela. Al terminar se registran el rol y los toques que descartó el filtro (nunca el token).
 
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{ConnectInfo, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use rp_core::{leer_mensaje, validar_con, EstadoMando, Filtro, Guardian, MsgCliente, MsgServidor, Rol};
-use tokio::sync::{oneshot, OwnedSemaphorePermit};
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{sleep_until, timeout, Instant};
 
 use super::EstadoServidor;
@@ -43,7 +46,12 @@ pub const SILENCIO_MS: u64 = 500;
 pub const TOPE_CONEXION: Duration = Duration::from_secs(3600 + 30);
 /// Conexiones que pueden estar a la vez esperando `auth` (las demás reciben 503 antes del upgrade).
 /// /ctl es público por Caddy: sin tope, muchas conexiones que nunca se autentican se juntan sin límite.
-pub const MAX_SIN_AUTH: usize = 32;
+/// Es el tope de memoria; a una IP sola la frena `MAX_SIN_AUTH_POR_IP`.
+pub const MAX_SIN_AUTH: usize = 512;
+/// Conexiones de una misma IP (IPv6: de un mismo /64) que pueden estar a la vez esperando `auth`. Con
+/// un tope global solo, una IP que abre ~16 conexiones por segundo (cada una ocupa su lugar hasta
+/// `PLAZO_AUTH`) dejaba afuera al operador. Una conexión legítima lo ocupa unos milisegundos.
+pub const MAX_SIN_AUTH_POR_IP: usize = 4;
 /// Tope de un mensaje (una credencial ocupa menos de 1 KiB).
 const MAX_MENSAJE: usize = 4 * 1024;
 /// Plazo para mandar el último mensaje antes de cerrar (un cliente que no lee no traba la tarea).
@@ -53,6 +61,99 @@ pub(super) struct Ocupante {
     id: u64,
     rol: Rol,
     reemplazo: oneshot::Sender<()>,
+}
+
+/// Lugares para las conexiones que todavía no se autenticaron: el tope global y el de cada IP.
+pub(super) struct SinAuth {
+    global: Arc<Semaphore>,
+    /// Lugares ocupados por IP; una IP sin lugares ocupados no queda en el mapa (como mucho
+    /// `MAX_SIN_AUTH` entradas).
+    por_ip: Mutex<HashMap<IpAddr, usize>>,
+}
+
+/// Un lugar de `SinAuth`. Se devuelve al soltarlo, en cualquier camino: autenticada (bien o mal),
+/// plazo vencido, cierre antes de `auth`, upgrade fallido (axum suelta la clausura sin llamarla),
+/// pánico o tarea cancelada.
+pub(super) struct Lugar {
+    sin_auth: Arc<SinAuth>,
+    ip: IpAddr,
+    _global: OwnedSemaphorePermit,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum SinLugar {
+    Global,
+    PorIp,
+}
+
+impl SinAuth {
+    pub(super) fn new() -> Arc<Self> {
+        Arc::new(Self { global: Arc::new(Semaphore::new(MAX_SIN_AUTH)), por_ip: Mutex::new(HashMap::new()) })
+    }
+
+    fn con_mapa<R>(&self, f: impl FnOnce(&mut HashMap<IpAddr, usize>) -> R) -> R {
+        f(&mut self.por_ip.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Toma un lugar para una conexión de `ip` (ya agrupada con `clave_ip`).
+    pub(super) fn tomar(self: &Arc<Self>, ip: IpAddr) -> Result<Lugar, SinLugar> {
+        self.con_mapa(|m| {
+            let n = m.get(&ip).copied().unwrap_or(0);
+            if n >= MAX_SIN_AUTH_POR_IP {
+                return Err(SinLugar::PorIp);
+            }
+            let global = self.global.clone().try_acquire_owned().map_err(|_| SinLugar::Global)?;
+            m.insert(ip, n + 1);
+            Ok(Lugar { sin_auth: self.clone(), ip, _global: global })
+        })
+    }
+
+    /// (lugares globales ocupados, IP con algún lugar ocupado).
+    #[cfg(test)]
+    pub(super) fn ocupados(&self) -> (usize, usize) {
+        (MAX_SIN_AUTH - self.global.available_permits(), self.con_mapa(|m| m.len()))
+    }
+}
+
+impl Drop for Lugar {
+    fn drop(&mut self) {
+        let ip = self.ip;
+        self.sin_auth.con_mapa(|m| {
+            match m.get_mut(&ip) {
+                Some(n) if *n > 1 => *n -= 1,
+                _ => {
+                    m.remove(&ip);
+                }
+            }
+        });
+    }
+}
+
+/// La IP del cliente. Si el par es la propia máquina (Caddy), la última de `X-Forwarded-For`: Caddy
+/// (sin `trusted_proxies`) descarta la que manda el cliente y pone la del par TCP, y si alguna vez
+/// confiara en otro proxy, la agregaría al final. Si el par no es local, o el encabezado falta o no
+/// se entiende, la del par: nadie de afuera elige con qué IP cuenta.
+pub(super) fn ip_cliente(par: SocketAddr, h: &HeaderMap) -> IpAddr {
+    let ip_par = par.ip().to_canonical();
+    if !ip_par.is_loopback() {
+        return ip_par;
+    }
+    h.get_all("x-forwarded-for")
+        .iter()
+        .next_back()
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.rsplit(',').next())
+        .and_then(|v| v.trim().parse::<IpAddr>().ok())
+        .map(|ip| ip.to_canonical())
+        .unwrap_or(ip_par)
+}
+
+/// La clave del tope por IP: la IPv4 entera; de una IPv6, su /64 (lo que tiene una sola conexión de casa).
+pub(super) fn clave_ip(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & !((1u128 << 64) - 1))),
+        v4 => v4,
+    }
 }
 
 impl<S: SesionPs5> EstadoServidor<S> {
@@ -117,12 +218,29 @@ impl<S: SesionPs5> Drop for Dueno<S> {
     }
 }
 
-pub(super) async fn ctl<S: SesionPs5>(State(e): State<Arc<EstadoServidor<S>>>, ws: WebSocketUpgrade) -> Response {
+pub(super) async fn ctl<S: SesionPs5>(
+    State(e): State<Arc<EstadoServidor<S>>>,
+    ConnectInfo(par): ConnectInfo<SocketAddr>,
+    encabezados: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
     // El lugar se toma antes del upgrade y se suelta al terminar la autenticación (o si el upgrade falla).
-    let Ok(lugar) = e.sin_auth.clone().try_acquire_owned() else {
-        static LIM: crate::registro::Limitado = crate::registro::Limitado::new();
-        crate::limitado!(4, LIM, "ctl: {MAX_SIN_AUTH} conexiones esperando auth; rechazo otra (503)");
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    let lugar = match e.sin_auth.tomar(clave_ip(ip_cliente(par, &encabezados))) {
+        Ok(l) => l,
+        Err(motivo) => {
+            // Sin la IP en el registro.
+            static GLOBAL: crate::registro::Limitado = crate::registro::Limitado::new();
+            static POR_IP: crate::registro::Limitado = crate::registro::Limitado::new();
+            match motivo {
+                SinLugar::Global => crate::limitado!(4, GLOBAL, "ctl: {MAX_SIN_AUTH} conexiones esperando auth; rechazo otra (503)"),
+                SinLugar::PorIp => crate::limitado!(
+                    4,
+                    POR_IP,
+                    "ctl: una IP ya tiene {MAX_SIN_AUTH_POR_IP} conexiones esperando auth; rechazo otra (503)"
+                ),
+            }
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
     };
     ws.max_message_size(MAX_MENSAJE).max_frame_size(MAX_MENSAJE).on_upgrade(move |socket| conexion(e, socket, lugar))
 }
@@ -178,7 +296,7 @@ enum Fin {
     Reemplazada,
 }
 
-async fn conexion<S: SesionPs5>(e: Arc<EstadoServidor<S>>, mut socket: WebSocket, lugar: OwnedSemaphorePermit) {
+async fn conexion<S: SesionPs5>(e: Arc<EstadoServidor<S>>, mut socket: WebSocket, lugar: Lugar) {
     let id = e.proximo_id.fetch_add(1, Ordering::Relaxed);
     // El token vive solo en este brazo: se valida (con la hora de cuando llegó) y se suelta.
     let (validada, ahora_s) = match timeout(PLAZO_AUTH, leer(&mut socket)).await {

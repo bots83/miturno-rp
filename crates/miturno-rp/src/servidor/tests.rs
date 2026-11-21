@@ -585,34 +585,179 @@ async fn ctl_exp_enorme_no_entra_en_panico_y_se_corta_al_tope() {
 
 /// Intenta el handshake de `/ctl`: `Err` con el código HTTP si el servidor no lo acepta.
 async fn handshake(b: &Banco) -> Result<Ws, u16> {
-    let (cli, srv) = tokio::io::duplex(64 * 1024);
-    b.conexiones.send((srv, local())).await.unwrap();
-    match tokio_tungstenite::client_async("ws://127.0.0.1:7070/ctl", cli).await {
+    handshake_desde(b, local(), None).await
+}
+
+/// Como `handshake`, desde la IP de par `desde` y, si hay, con el `X-Forwarded-For` que pone Caddy.
+async fn handshake_desde(b: &Banco, desde: SocketAddr, xff: Option<&str>) -> Result<Ws, u16> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let (cli, srv) = tokio::io::duplex(16 * 1024);
+    b.conexiones.send((srv, desde)).await.unwrap();
+    let mut pedido = "ws://127.0.0.1:7070/ctl".into_client_request().unwrap();
+    if let Some(x) = xff {
+        pedido.headers_mut().insert("x-forwarded-for", x.parse().unwrap());
+    }
+    match tokio_tungstenite::client_async(pedido, cli).await {
         Ok((ws, _)) => Ok(ws),
         Err(tokio_tungstenite::tungstenite::Error::Http(r)) => Err(r.status().as_u16()),
         Err(e) => panic!("handshake: {e}"),
     }
 }
 
+/// La IP número `n` de un rango de documentación (TEST-NET-2 y TEST-NET-3), distinta para cada `n < 500`.
+fn ip_n(n: usize) -> String {
+    format!("{}.{}", if n < 250 { "198.51.100" } else { "203.0.113" }, n % 250 + 1)
+}
+
+/// Llena el tope global con conexiones sin autenticar, `MAX_SIN_AUTH_POR_IP` por cada IP.
+async fn llenar_tope_global(b: &Banco, colgadas: &mut Vec<Ws>) {
+    for i in 0..ctl::MAX_SIN_AUTH {
+        let ip = ip_n(i / ctl::MAX_SIN_AUTH_POR_IP);
+        colgadas.push(handshake_desde(b, local(), Some(&ip)).await.expect("dentro del tope"));
+    }
+}
+
 #[tokio::test(start_paused = true)]
-async fn ctl_con_32_conexiones_esperando_auth_la_siguiente_recibe_503() {
-    // /ctl es público: muchas conexiones que nunca se autentican no pueden juntarse sin tope.
+async fn ctl_con_el_tope_global_de_conexiones_esperando_auth_la_siguiente_recibe_503() {
+    // /ctl es público: muchas conexiones que nunca se autentican no pueden juntarse sin tope, aunque
+    // vengan de muchas IP.
     let b = banco();
     let mut colgadas = Vec::new();
-    for _ in 0..ctl::MAX_SIN_AUTH {
-        colgadas.push(handshake(&b).await.expect("dentro del tope"));
-    }
-    assert_eq!(handshake(&b).await.err(), Some(503));
+    llenar_tope_global(&b, &mut colgadas).await;
+    assert_eq!(handshake_desde(&b, local(), Some("192.0.2.200")).await.err(), Some(503), "IP nueva, sin lugar global");
+    assert_eq!(handshake(&b).await.err(), Some(503), "directo, sin lugar global");
     // Al vencer el plazo de auth se cierran y liberan el lugar.
     sleep(ctl::PLAZO_AUTH + Duration::from_millis(50)).await;
-    let mut ws = handshake(&b).await.expect("con lugar de nuevo");
+    colgadas.clear();
+    let mut ws = handshake_desde(&b, local(), Some("192.0.2.200")).await.expect("con lugar de nuevo");
     enviar(&mut ws, json!({"t":"auth","token":token("operador")})).await;
     assert_eq!(recibir(&mut ws).await, Some(json!({"t":"ok","rol":"operador"})));
-    // Una conexión ya autenticada no ocupa lugar: entran otras 32 sin autenticar.
-    for _ in 0..ctl::MAX_SIN_AUTH {
-        colgadas.push(handshake(&b).await.expect("la autenticada no cuenta"));
+    // Una conexión ya autenticada no ocupa lugar: el tope se llena entero otra vez.
+    llenar_tope_global(&b, &mut colgadas).await;
+    assert_eq!(handshake_desde(&b, local(), Some("192.0.2.201")).await.err(), Some(503));
+}
+
+#[tokio::test(start_paused = true)]
+async fn ctl_una_ip_con_muchas_conexiones_sin_auth_no_deja_afuera_a_otra() {
+    // Con un solo tope global, ~16 conexiones por segundo desde una IP dejaban afuera al operador.
+    let b = banco();
+    let mut colgadas = Vec::new();
+    for _ in 0..ctl::MAX_SIN_AUTH_POR_IP {
+        colgadas.push(handshake_desde(&b, local(), Some("198.51.100.7")).await.expect("dentro del tope de la IP"));
     }
-    assert_eq!(handshake(&b).await.err(), Some(503));
+    assert_eq!(handshake_desde(&b, local(), Some("198.51.100.7")).await.err(), Some(503));
+    // Caddy agrega la IP del cliente al final: lo que mande el cliente adelante no la cambia.
+    assert_eq!(handshake_desde(&b, local(), Some("192.0.2.1, 198.51.100.7")).await.err(), Some(503));
+    let mut ws = handshake_desde(&b, local(), Some("198.51.100.8")).await.expect("otra IP entra");
+    enviar(&mut ws, json!({"t":"auth","token":token("operador")})).await;
+    assert_eq!(recibir(&mut ws).await, Some(json!({"t":"ok","rol":"operador"})));
+    // Al vencer el plazo, la IP llena vuelve a tener lugar.
+    sleep(ctl::PLAZO_AUTH + Duration::from_millis(50)).await;
+    colgadas.clear();
+    for _ in 0..ctl::MAX_SIN_AUTH_POR_IP {
+        colgadas.push(handshake_desde(&b, local(), Some("198.51.100.7")).await.expect("plazo vencido: lugar libre"));
+    }
+    assert_eq!(handshake_desde(&b, local(), Some("198.51.100.7")).await.err(), Some(503));
+}
+
+#[tokio::test(start_paused = true)]
+async fn ctl_las_ipv6_de_un_mismo_64_cuentan_como_una() {
+    // Con IPv6 una sola conexión de casa tiene un /64 entero: contar cada dirección no pondría tope.
+    let b = banco();
+    let mut colgadas = Vec::new();
+    for i in 0..ctl::MAX_SIN_AUTH_POR_IP {
+        let ip = format!("2001:db8:1:2::{:x}", i + 1);
+        colgadas.push(handshake_desde(&b, local(), Some(&ip)).await.expect("dentro del tope del /64"));
+    }
+    assert_eq!(handshake_desde(&b, local(), Some("2001:db8:1:2:ffff::1")).await.err(), Some(503));
+    assert!(handshake_desde(&b, local(), Some("2001:db8:1:3::1")).await.is_ok(), "otro /64 entra");
+}
+
+#[tokio::test(start_paused = true)]
+async fn ctl_si_el_par_no_es_local_el_x_forwarded_for_no_cuenta() {
+    // Solo Caddy (desde la misma máquina) puede decir de qué IP viene la conexión.
+    let b = banco();
+    let mut colgadas = Vec::new();
+    for i in 0..ctl::MAX_SIN_AUTH_POR_IP {
+        colgadas.push(handshake_desde(&b, remota(), Some(&ip_n(i))).await.expect("dentro del tope de la IP"));
+    }
+    assert_eq!(handshake_desde(&b, remota(), Some(&ip_n(99))).await.err(), Some(503), "cuenta la IP del par");
+    assert!(handshake_desde(&b, local(), Some(&ip_n(99))).await.is_ok());
+}
+
+#[tokio::test(start_paused = true)]
+async fn ctl_los_lugares_se_liberan_al_cerrar_antes_de_auth_y_al_autenticarse() {
+    let b = banco();
+    let ip = "198.51.100.7";
+    let tope = ctl::MAX_SIN_AUTH_POR_IP;
+    // Cerrar antes de `auth`: con cierre de WebSocket y cortando la conexión sin más.
+    for i in 0..tope {
+        let mut ws = handshake_desde(&b, local(), Some(ip)).await.expect("dentro del tope");
+        if i % 2 == 0 {
+            ws.close(None).await.unwrap();
+        }
+        drop(ws);
+    }
+    // Mucho menos que el plazo de auth: lo libera el cierre, no el plazo.
+    sleep(Duration::from_millis(10)).await;
+    assert_eq!(b.estado.sin_auth.ocupados(), (0, 0), "ni lugar global ni entrada de la IP");
+    // Autenticarse también libera el lugar (bien o con una credencial mala).
+    let mut abiertas = Vec::new();
+    for i in 0..tope {
+        let mut ws = handshake_desde(&b, local(), Some(ip)).await.expect("los cerrados liberaron el lugar");
+        let tk = if i == 0 { "basura".to_string() } else { token("operador") };
+        enviar(&mut ws, json!({"t":"auth","token":tk})).await;
+        assert!(recibir(&mut ws).await.is_some());
+        abiertas.push(ws);
+    }
+    let mut colgadas = Vec::new();
+    for _ in 0..tope {
+        colgadas.push(handshake_desde(&b, local(), Some(ip)).await.expect("las autenticadas no ocupan lugar"));
+    }
+    assert_eq!(handshake_desde(&b, local(), Some(ip)).await.err(), Some(503));
+    assert_eq!(b.estado.sin_auth.ocupados(), (tope, 1));
+}
+
+#[test]
+fn ctl_los_lugares_sin_auth_se_devuelven_al_soltarlos() {
+    // Un upgrade fallido suelta la clausura (y el lugar) sin llamarla: alcanza con soltarlo.
+    let s = ctl::SinAuth::new();
+    let a: std::net::IpAddr = "198.51.100.7".parse().unwrap();
+    let otra: std::net::IpAddr = "198.51.100.8".parse().unwrap();
+    let lugares: Vec<_> = (0..ctl::MAX_SIN_AUTH_POR_IP).map(|_| s.tomar(a).unwrap()).collect();
+    assert_eq!(s.tomar(a).err(), Some(ctl::SinLugar::PorIp));
+    let b = s.tomar(otra).unwrap();
+    assert_eq!(s.ocupados(), (ctl::MAX_SIN_AUTH_POR_IP + 1, 2));
+    drop(lugares);
+    assert_eq!(s.ocupados(), (1, 1));
+    drop(b);
+    assert_eq!(s.ocupados(), (0, 0));
+    // Un rechazo no deja nada tomado.
+    let todos: Vec<_> = (0..ctl::MAX_SIN_AUTH).map(|i| s.tomar(ip_n(i / ctl::MAX_SIN_AUTH_POR_IP).parse().unwrap()).unwrap()).collect();
+    assert_eq!(s.tomar("192.0.2.1".parse().unwrap()).err(), Some(ctl::SinLugar::Global));
+    assert_eq!(s.ocupados(), (ctl::MAX_SIN_AUTH, ctl::MAX_SIN_AUTH / ctl::MAX_SIN_AUTH_POR_IP));
+    drop(todos);
+    assert_eq!(s.ocupados(), (0, 0));
+}
+
+#[test]
+fn ctl_la_ip_del_cliente_sale_del_x_forwarded_for_solo_si_el_par_es_local() {
+    let h = |x: &str| {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-forwarded-for", x.parse().unwrap());
+        h
+    };
+    let ip = |t: &str| -> std::net::IpAddr { t.parse().unwrap() };
+    let sin = axum::http::HeaderMap::new();
+    assert_eq!(ctl::ip_cliente(local(), &h("198.51.100.7")), ip("198.51.100.7"));
+    assert_eq!(ctl::ip_cliente(local(), &h("192.0.2.1, 198.51.100.7")), ip("198.51.100.7"), "la última, la de Caddy");
+    assert_eq!(ctl::ip_cliente(local(), &h("basura")), ip("127.0.0.1"));
+    assert_eq!(ctl::ip_cliente(local(), &sin), ip("127.0.0.1"));
+    assert_eq!(ctl::ip_cliente(local(), &h("::ffff:198.51.100.7")), ip("198.51.100.7"));
+    assert_eq!(ctl::ip_cliente("[::1]:5000".parse().unwrap(), &h("2001:db8::1")), ip("2001:db8::1"));
+    assert_eq!(ctl::ip_cliente(remota(), &h("198.51.100.7")), remota().ip(), "de afuera no se cree");
+    assert_eq!(ctl::clave_ip(ip("2001:db8:1:2:3:4:5:6")), ip("2001:db8:1:2::"));
+    assert_eq!(ctl::clave_ip(ip("198.51.100.7")), ip("198.51.100.7"));
 }
 
 #[tokio::test(start_paused = true)]

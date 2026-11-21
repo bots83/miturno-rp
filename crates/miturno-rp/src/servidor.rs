@@ -117,8 +117,9 @@ pub struct EstadoServidor<S: SesionPs5> {
     t0: Instant,
     /// El único controlador que puede mandar a la PS5.
     ranura: Mutex<Option<ctl::Ocupante>>,
-    /// Lugares para conexiones de /ctl que todavía no se autenticaron (`ctl::MAX_SIN_AUTH`).
-    sin_auth: Arc<tokio::sync::Semaphore>,
+    /// Lugares para conexiones de /ctl que todavía no se autenticaron (`ctl::MAX_SIN_AUTH` y
+    /// `ctl::MAX_SIN_AUTH_POR_IP`).
+    sin_auth: Arc<ctl::SinAuth>,
     proximo_id: AtomicU64,
     cpu: Mutex<f64>,
     /// Toques descartados por el filtro, sumados de todas las conexiones terminadas.
@@ -140,7 +141,7 @@ impl<S: SesionPs5> EstadoServidor<S> {
             reloj_s: p.reloj_s,
             t0: Instant::now(),
             ranura: Mutex::new(None),
-            sin_auth: Arc::new(tokio::sync::Semaphore::new(ctl::MAX_SIN_AUTH)),
+            sin_auth: ctl::SinAuth::new(),
             proximo_id: AtomicU64::new(1),
             cpu: Mutex::new(0.0),
             descartados: AtomicU64::new(0),
