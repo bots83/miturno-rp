@@ -584,6 +584,20 @@ async fn ctl_exp_enorme_no_entra_en_panico_y_se_corta_al_tope() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn ctl_una_credencial_mas_larga_que_las_de_la_api_se_corta_a_la_hora_y_30_s() {
+    // Las credenciales de la api duran 1 h: un `exp` más largo (un error de la api) no da más control.
+    assert_eq!(ctl::TOPE_CONEXION, Duration::from_secs(3600 + 30));
+    let b = banco();
+    let mut c = claims("operador");
+    c["exp"] = json!(AHORA + 2 * 3600);
+    let (mut ws, r) = b.ws_con(&firmar(&c)).await;
+    assert_eq!(r, json!({"t":"ok","rol":"operador"}));
+    let t = Instant::now();
+    assert_eq!(recibir(&mut ws).await, Some(json!({"t":"error","codigo":"VENCIDA"})));
+    assert!(t.elapsed() <= Duration::from_secs(3630), "{:?}", t.elapsed());
+}
+
+#[tokio::test(start_paused = true)]
 async fn ctl_al_terminar_cuenta_los_descartados_del_filtro() {
     let b = banco();
     let (mut ws, _) = b.ws_con(&token("jugador")).await;

@@ -34,9 +34,11 @@ use crate::sesion::SesionPs5;
 pub const PLAZO_AUTH: Duration = Duration::from_secs(2);
 /// Silencio (sin mensajes ni latidos) tras el que se suelta todo.
 pub const SILENCIO_MS: u64 = 500;
-/// Tope de una conexión aunque la credencial venza más tarde (las de F1 duran 1 h). También evita
-/// desbordar el reloj con un `exp` enorme.
-pub const TOPE_CONEXION: Duration = Duration::from_secs(24 * 3600);
+/// Tope de una conexión aunque la credencial venza más tarde: lo que dura la credencial más larga
+/// que emite la api (1 h, `CREDENCIAL_TTL_S`) más la tolerancia de reloj. Así un `exp` largo por un
+/// error de la api no da más control, y un `exp` enorme no desborda el reloj. Si la api emite
+/// credenciales más largas, hay que subirlo.
+pub const TOPE_CONEXION: Duration = Duration::from_secs(3600 + 30);
 /// Tope de un mensaje (una credencial ocupa menos de 1 KiB).
 const MAX_MENSAJE: usize = 4 * 1024;
 /// Plazo para mandar el último mensaje antes de cerrar (un cliente que no lee no traba la tarea).
