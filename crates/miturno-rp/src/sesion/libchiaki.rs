@@ -168,6 +168,14 @@ pub fn motivo(r: QuitReason) -> MotivoCierre {
     }
 }
 
+/// El fin de sesión tal como lo da libchiaki, para el registro: el `ChiakiQuitReason` (nombre y número),
+/// su texto, el texto que mandó la PS5 al desconectar (`reason_str`, viene solo con
+/// `STREAM_CONNECTION_REMOTE_*`; tapado el nombre de casa) y el motivo que usa el ciclo.
+fn describir_cierre(r: QuitReason, reason_str: &str) -> String {
+    let texto = if reason_str.is_empty() { "sin texto de la PS5".to_owned() } else { format!("texto de la PS5: {:?}", ocultar(reason_str)) };
+    format!("{:?} = {} ({:?}); {texto}; motivo {:?}", r, r as u32, libchiaki::quit_reason_string(r), motivo(r))
+}
+
 /// Textos privados (el nombre de casa) que se tapan en el registro de libchiaki.
 static OCULTAR: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
@@ -258,9 +266,7 @@ fn abrir<'a>(
                 // siempre después de liberar esta sesión.
                 let _ = cmd.send(Cmd::Terminada(numero));
                 if !a_pedido.load(Ordering::SeqCst) {
-                    let que = libchiaki::quit_reason_string(reason);
-                    let detalle = if reason_str.is_empty() || reason_str == que { String::new() } else { format!(" ({})", ocultar(&reason_str)) };
-                    crate::info!("sesión: terminó: {que}{detalle}");
+                    crate::info!("sesión: terminó: {}", describir_cierre(reason, &reason_str));
                     avisar(&ev, EventoSesion::Cerrada { motivo: motivo(reason) });
                 }
             }
@@ -532,6 +538,39 @@ mod tests {
         assert_eq!(motivo(CHIAKI_QUIT_REASON_STREAM_CONNECTION_REMOTE_DISCONNECTED), MotivoCierre::Red);
         assert_eq!(motivo(CHIAKI_QUIT_REASON_SESSION_REQUEST_RP_VERSION_MISMATCH), MotivoCierre::Otro);
         assert_eq!(super::super::CODIGO_EN_USO, ffi::CHIAKI_RP_APPLICATION_REASON_IN_USE);
+    }
+
+    #[test]
+    fn el_cierre_se_registra_con_el_motivo_crudo_de_libchiaki() {
+        use ffi::ChiakiQuitReason::*;
+        let r = CHIAKI_QUIT_REASON_STREAM_CONNECTION_REMOTE_DISCONNECTED;
+        let d = describir_cierre(r, "Un texto de la PS5");
+        assert!(d.contains("CHIAKI_QUIT_REASON_STREAM_CONNECTION_REMOTE_DISCONNECTED = 11"), "{d}");
+        assert!(d.contains(&format!("\"{}\"", libchiaki::quit_reason_string(r))), "{d}");
+        assert!(d.contains("texto de la PS5: \"Un texto de la PS5\""), "{d}");
+        assert!(d.ends_with("motivo Red"), "{d}");
+
+        let d = describir_cierre(CHIAKI_QUIT_REASON_SESSION_REQUEST_RP_IN_USE, "");
+        assert!(d.contains("CHIAKI_QUIT_REASON_SESSION_REQUEST_RP_IN_USE = 4"), "{d}");
+        assert!(d.contains("sin texto de la PS5"), "{d}");
+        assert!(d.ends_with("motivo EnUso"), "{d}");
+
+        let d = describir_cierre(CHIAKI_QUIT_REASON_CTRL_UNKNOWN, "");
+        assert!(d.contains("CHIAKI_QUIT_REASON_CTRL_UNKNOWN = 7") && d.ends_with("motivo Otro"), "{d}");
+    }
+
+    #[test]
+    fn el_texto_de_cierre_tapa_el_nombre_de_casa() {
+        registrar_privado(&Perfil {
+            host: "consola-privada.ejemplo.org".into(),
+            regist_key: [0; 16],
+            morning: [0; 16],
+            account_id: [0; 8],
+            bitrate_kbps: 1,
+        });
+        let r = ffi::ChiakiQuitReason::CHIAKI_QUIT_REASON_STREAM_CONNECTION_UNKNOWN;
+        let d = describir_cierre(r, "sin ruta a consola-privada.ejemplo.org");
+        assert!(d.contains("sin ruta a [casa]") && !d.contains("consola-privada"), "{d}");
     }
 
     #[test]
