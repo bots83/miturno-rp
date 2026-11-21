@@ -1,0 +1,22 @@
+#!/usr/sbin/nft -f
+# Firewall de salida para el relé de coturn (servidor de video de MiTurno). Lo carga
+# miturno-turn-nft.service antes de coturn; desplegar-video.sh lo instala en /etc/coturn/.
+#
+# coturn solo deja relevar hacia la propia IP pública (allowed-peer-ip), pero no sabe filtrar por
+# puerto. Ese tráfico es local (va por lo) y ufw no lo filtra. Sin esta regla, quien tiene una
+# credencial podría mandar UDP por el relé a cualquier puerto de la máquina: el 3478 del propio
+# coturn (TURN dentro de TURN), los puertos de relé de otros usuarios (49160-49200) o cualquier
+# servicio UDP en 0.0.0.0. Acá se descarta todo lo que sale de un puerto de relé de coturn hacia la
+# propia IP, salvo hacia 8189 (el WebRTC de MediaMTX), que es para lo único que está el TURN.
+# No toca las respuestas de coturn a los clientes (salen de 3478/5349, no del rango de relé).
+#
+# Tabla propia (inet miturno_turn): ufw (iptables-nft) usa las tablas ip/ip6 filter y su reload no
+# la toca. "table" + "delete table" + la definición: se reemplaza entera en una sola transacción.
+table inet miturno_turn
+delete table inet miturno_turn
+table inet miturno_turn {
+	chain salida {
+		type filter hook output priority filter; policy accept;
+		meta skuid "turnserver" ip saddr 172.237.53.111 udp sport 49160-49200 ip daddr 172.237.53.111 udp dport != 8189 counter drop
+	}
+}

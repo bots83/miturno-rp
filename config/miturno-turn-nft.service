@@ -1,0 +1,17 @@
+# Carga /etc/coturn/miturno-turn.nft (firewall de salida del relé de coturn) antes de coturn.
+# coturn lo requiere (RequiredBy): si la regla no carga, coturn no arranca; si se para esta unidad,
+# se para coturn. Lo instala y habilita scripts/video/desplegar-video.sh (repo principal).
+[Unit]
+Description=MiTurno: el relé de coturn solo entrega en la propia IP al puerto 8189 (MediaMTX)
+Before=coturn.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/coturn/miturno-turn.nft
+ExecReload=/usr/sbin/nft -f /etc/coturn/miturno-turn.nft
+ExecStop=/usr/sbin/nft delete table inet miturno_turn
+
+[Install]
+WantedBy=multi-user.target
+RequiredBy=coturn.service
