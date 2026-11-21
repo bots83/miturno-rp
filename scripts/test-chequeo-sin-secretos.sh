@@ -27,6 +27,11 @@ casos=(
   "registración de la PS5|rp_regist_key=@ByteArray(abc)"
   "token de PSN|psn_refresh_token=abc"
   "token de bot de Telegram|1234567890:AAEhBP0av18SuperSecretoDeBotDeTelegramX"
+  "registración de la PS5 en ps5.env|PS5_REGIST_KEY=9f8e7d6c"
+  "clave de despertar de la PS5|PS5_MORNING=00112233445566778899aabbccddeeff"
+  "cuenta PSN de la PS5|PS5_ACCOUNT_ID=\"QUJDREVGR0g=\""
+  "variable VIDEO_ con valor|VIDEO_CTL_TOKEN=abc123def456"
+  "secreto de coturn|static-auth-secret=0123456789abcdef"
 )
 for caso in "${casos[@]}"; do
   nombre=${caso%%|*}; valor=${caso#*|}
@@ -41,6 +46,21 @@ nuevo_repo
 echo "KICK_STREAM_KEY=" > "$T/r/ejemplo.txt"; echo "rtmps://ingest.ejemplo/app/" >> "$T/r/ejemplo.txt"
 correr --todo && r=0 || r=$?
 esperar "variable vacía de ejemplo (documentación): pasa" '[ "$r" = 0 ]'
+
+nuevo_repo
+{ echo "# (static-auth-secret=… lo agrega desplegar-video.sh)"; echo "VIDEO_CTL_URL="; echo 'PS5_REGIST_KEY=$CLAVE'; } > "$T/r/ejemplo.txt"
+correr --todo && r=0 || r=$?
+esperar "PS5_/VIDEO_/static-auth-secret sin valor o con un marcador: pasa" '[ "$r" = 0 ]'
+
+nuevo_repo
+mkdir -p "$T/r/crates/miturno-rp/src"
+printf '    const PS5: &str = "PS5_REGIST_KEY=a1b2c3d4\\nPS5_MORNING=000102030405060708090a0b0c0d0e0f\\nPS5_ACCOUNT_ID=\\"NDJvGJAjYVQ=\\"\\n";\n' > "$T/r/crates/miturno-rp/src/config.rs"
+git -C "$T/r" add -A; git -C "$T/r" commit -qm "fixture"
+correr --historial && r=0 || r=$?
+esperar "el ps5.env falso de los tests de config.rs no cuenta (tampoco en el historial)" '[ "$r" = 0 ]'
+printf '    const PS5: &str = "PS5_REGIST_KEY=a1b2c3d5\\n";\n' > "$T/r/crates/miturno-rp/src/config.rs"
+correr --todo && r=0 || r=$?
+esperar "otro valor en el mismo lugar sí cuenta" '[ "$r" != 0 ]'
 
 nuevo_repo
 echo "sk_us-west-2_AbCdEfGh1234567890" > "$T/r/viejo.txt"; git -C "$T/r" add -A; git -C "$T/r" commit -qm "oops"

@@ -21,6 +21,11 @@ if [ -z "${CASA_PATRON:-}" ] || [ -z "${CASA_IP:-}" ]; then
 fi
 
 # Regla|tipo (F = texto fijo, E = expresión regular)|patrón
+# Los valores de PS5_*, VIDEO_* y static-auth-secret cuentan si empiezan como un valor de verdad (letra,
+# número o base64, con o sin comillas): "=", "=$VAR", "=…" o "=<…>" son documentación.
+VALOR="[\"']?[A-Za-z0-9+/]"
+# El ps5.env falso de los tests de crates/miturno-rp/src/config.rs (tal cual, también en el historial).
+PS5_FALSO='PS5_REGIST_KEY=a1b2c3d4\\nPS5_MORNING=000102030405060708090a0b0c0d0e0f\\nPS5_ACCOUNT_ID=\\"NDJvGJAjYVQ=\\"'
 REGLAS=(
   "nombre DDNS de casa|F|$CASA_PATRON"
   "IP de casa|F|$CASA_IP"
@@ -31,7 +36,12 @@ REGLAS=(
   "registración de la PS5|E|rp_regist_key="
   "token de PSN|E|psn_(refresh|auth)_token="
   "token de bot de Telegram|E|[0-9]{8,}:[A-Za-z0-9_-]{30,}"
+  "datos de la PS5 (ps5.env) con valor|E|PS5_(REGIST_KEY|MORNING|ACCOUNT_ID)=$VALOR"
+  "variable VIDEO_ con valor|E|VIDEO_[A-Z_]+=$VALOR"
+  "secreto de coturn (static-auth-secret) con valor|E|static-auth-secret=$VALOR"
 )
+# Excepciones por regla (expresión regular): las líneas que la tienen no cuentan para esa regla.
+declare -A EXCEPTO=(["datos de la PS5 (ps5.env) con valor"]="$PS5_FALSO")
 # Este script y su test contienen los patrones a propósito.
 EXCLUIR=(":(exclude)scripts/chequeo-sin-secretos.sh" ":(exclude)scripts/test-chequeo-sin-secretos.sh")
 
@@ -45,9 +55,10 @@ esac
 hallazgos=0
 for regla in "${REGLAS[@]}"; do
   nombre=${regla%%|*}; resto=${regla#*|}; tipo=${resto%%|*}; patron=${resto#*|}
+  excepto=(); [ -n "${EXCEPTO[$nombre]:-}" ] && excepto=(--and --not -e "${EXCEPTO[$nombre]}")
   bandera=-E; [ "$tipo" = F ] && bandera=-F
   # -c: solo "archivo:cantidad" (o "commit:archivo:cantidad"); el contenido nunca sale.
-  if salida=$(git grep -c -I "$bandera" -e "$patron" "${DONDE[@]}" "${REVS[@]}" -- . "${EXCLUIR[@]}" 2>/dev/null); then
+  if salida=$(git grep -c -I "$bandera" -e "$patron" "${excepto[@]}" "${DONDE[@]}" "${REVS[@]}" -- . "${EXCLUIR[@]}" 2>/dev/null); then
     while IFS= read -r linea; do
       donde=${linea%:*}
       [ "$MODO" = --historial ] && donde="commit ${donde:0:12}"
