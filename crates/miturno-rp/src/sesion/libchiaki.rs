@@ -235,7 +235,9 @@ fn abrir<'a>(
                 // siempre después de liberar esta sesión.
                 let _ = cmd.send(Cmd::Terminada(numero));
                 if !a_pedido.load(Ordering::SeqCst) {
-                    crate::info!("sesión: la PS5 cerró la sesión: {}", ocultar(&reason_str));
+                    let que = libchiaki::quit_reason_string(reason);
+                    let detalle = if reason_str.is_empty() || reason_str == que { String::new() } else { format!(" ({})", ocultar(&reason_str)) };
+                    crate::info!("sesión: terminó: {que}{detalle}");
                     avisar(&ev, EventoSesion::Cerrada { motivo: motivo(reason) });
                 }
             }

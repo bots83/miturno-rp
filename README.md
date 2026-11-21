@@ -15,6 +15,18 @@ Corre en el servidor de video de MiTurno. **Este repo no tiene secretos ni datos
 - `config/`: plantillas de configuración sin secretos.
 - `scripts/`: herramientas del repo, incluido el chequeo de secretos que corre antes de cada push.
 
+## Correr
+
+```bash
+miturno-rp [--config /etc/miturno-video/rp.toml] [--casa /etc/miturno-video/casa.env] [--ps5 /etc/miturno-video/ps5.env]
+```
+
+- `rp.toml` (plantilla en `config/rp.toml`, sin secretos): bitrate, destino UDP del MPEG-TS, dirección HTTP local, cartel, límites de Options, clave pública y token de control.
+- `casa.env`: `PS5_HOST` (nombre de la conexión de casa; privado, no se registra).
+- `ps5.env` (600): `PS5_REGIST_KEY`, `PS5_MORNING`, `PS5_ACCOUNT_ID` (secretos; nunca se imprimen).
+
+Sin sesión, la salida repite el cartel "Volvemos enseguida" (`/var/lib/miturno-video/cartel.ts`); al conectar, empalma en el primer keyframe de la PS5. Las marcas de tiempo son propias y continuas. Ante SIGTERM cierra la sesión con `session.stop()` antes de salir. `MITURNO_RP_DEPURAR=1` activa el registro de depuración.
+
 ## Compilar
 
 Requiere la librería libchiaki compilada con [nanpuyue/libchiaki](https://github.com/nanpuyue/libchiaki) (`build-libchiaki.sh`, `CHIAKI_VERSION=v1.10.1`):
