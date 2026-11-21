@@ -1,8 +1,12 @@
 //! miturno-rp: mantiene la sesión con la PS5 y saca su video sin recomprimir como MPEG-TS por UDP.
 //! Sin sesión, la salida muestra el cartel "Volvemos enseguida" para que nunca se corte.
-//! El servidor local (`/ctl`, `/interno/*`, `/control/*`) corre en el mismo runtime que el ciclo, pero
-//! en sus dos hilos de trabajo: el ciclo (y el mux) corre en el hilo principal, así una ráfaga de
-//! conexiones a /ctl o de pedidos de salud no le quita tiempo a la salida de video.
+//! El servidor local (`/ctl`, `/interno/*`, `/control/*`) corre en el mismo runtime de varios hilos que
+//! el ciclo: el ciclo (y el mux) es el futuro de `block_on` y corre en el hilo principal; lo lanzado con
+//! `spawn` (el servidor y el muestreo de CPU) corre en los dos hilos de trabajo, que además atienden los
+//! drivers de tiempo y de E/S de todo el runtime, también los del ciclo. Así una ráfaga en /ctl o de
+//! pedidos de salud no le quita CPU al ciclo, pero el aislamiento no es total: depende de que ninguna
+//! tarea de los hilos de trabajo los bloquee (hoy ninguna lo hace). Si alguna bloqueara, se demorarían
+//! también los timers y los sockets del ciclo.
 
 use std::process::ExitCode;
 use std::sync::Arc;
