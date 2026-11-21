@@ -7,3 +7,6 @@
 *.ini
 *.token
 *.secret
+
+# Espacio de trabajo local de las herramientas de desarrollo (nunca se publica).
+/.superpowers/
