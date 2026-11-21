@@ -20,7 +20,8 @@
 # con hidepid: cualquier proceso de otro usuario que NO tenga ProtectProc=invisible puede leer la línea
 # de comandos de ffmpeg. ProtectProc protege a quien lo lleva puesto (no ve a los demás), no a ffmpeg.
 # Por eso lo llevan los servicios expuestos a la red que corren con otro usuario: miturno-rp y
-# MediaMTX (en sus unidades), Caddy (drop-in caddy-miturno.conf) y coturn (drop-in de la Task 7).
+# MediaMTX (en sus unidades), y Caddy y coturn (el drop-in 50-miturno-procesos.conf que genera
+# scripts/video/desplegar-video.sh del repo principal).
 # Root y el usuario administrador miturno (que tiene sudo) la ven igual. Además, los mensajes de
 # ffmpeg pasan por un filtro que tapa cualquier URL rtmp(s) y cualquier clave sk_… antes de llegar
 # al journal.
@@ -35,7 +36,10 @@
 # por ejemplo: -map "[vigia]" -an -c:v rawvideo -pix_fmt gray -f rawvideo <destino del vigilante>.
 [Unit]
 Description=MiTurno: salida a Kick (ffmpeg 720p60 por RTMPS)
-After=network-online.target mediamtx.service
+# After=miturno-rp: en un apagado o un deploy, systemd para primero kick-out (el orden de parada es
+# el inverso del de arranque). Si se parara antes miturno-rp, ffmpeg se quedaría esperando la entrada
+# y systemd lo mataría al vencer TimeoutStopSec. No es un Requires: kick-out no arranca miturno-rp.
+After=network-online.target mediamtx.service miturno-rp.service
 Wants=network-online.target
 # Restart=always no tiene que rendirse nunca (el límite de arranques lo apagaría para siempre).
 StartLimitIntervalSec=0

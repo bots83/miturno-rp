@@ -10,7 +10,8 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/sbin/nft -f /etc/coturn/miturno-turn.nft
 ExecReload=/usr/sbin/nft -f /etc/coturn/miturno-turn.nft
-ExecStop=/usr/sbin/nft delete table inet miturno_turn
+# El - deja que pare aunque la tabla ya no esté (borrada a mano o por un nft flush ruleset).
+ExecStop=-/usr/sbin/nft delete table inet miturno_turn
 
 [Install]
 WantedBy=multi-user.target
