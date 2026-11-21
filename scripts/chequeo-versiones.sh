@@ -16,11 +16,16 @@ consultar() {
   curl -fsS --retry 3 -A miturno-build-check "https://crates.io/api/v1/crates/$1/$2" | jq -r '.version.created_at'
 }
 
+[ -r "$LOCK" ] || { echo "chequeo-versiones: no puedo leer $LOCK" >&2; exit 2; }
 mapfile -t PAQUETES < <(awk '
   /^\[\[package\]\]/ { n=""; v="" }
   /^name = /    { gsub(/"/,"",$3); n=$3 }
   /^version = / && n != "" { gsub(/"/,"",$3); v=$3 }
   /^source = "registry\+/ { print n " " v }' "$LOCK")
+# Falla cerrado: 0 paquetes quiere decir un lock vacío, roto o de un formato que no se entiende.
+if [ "${#PAQUETES[@]}" = 0 ]; then
+  echo "chequeo-versiones: $LOCK no tiene ningún paquete de crates.io; no sigo (¿lock roto o de otro formato?)" >&2; exit 2
+fi
 
 nuevos=0
 for p in "${PAQUETES[@]}"; do

@@ -28,9 +28,16 @@ esperar "uno demasiado nuevo: falla" '[ "$r" != 0 ]'
 esperar "nombra el crate y la versión" 'grep -q "nuevo-crate 2.3.4" "$T/salida"'
 esperar "no nombra al viejo" '! grep -q "viejo 1.0.0" "$T/salida"'
 
-printf 'version = 4\n\n[[package]]\nname = "nuevo-git"\nversion = "1.0.0"\nsource = "git+https://example.com/x#abc"\n\n[[package]]\nname = "nuevo-ruta"\nversion = "1.0.0"\n' > "$T/git.lock"
+printf 'version = 4\n\n[[package]]\nname = "viejo"\nversion = "1.0.0"\n%s\n\n[[package]]\nname = "nuevo-git"\nversion = "1.0.0"\nsource = "git+https://example.com/x#abc"\n\n[[package]]\nname = "nuevo-ruta"\nversion = "1.0.0"\n' "$reg" > "$T/git.lock"
 correr c git && r=0 || r=$?
 esperar "git y ruta se ignoran: pasa" '[ "$r" = 0 ]'
+
+# Sin ningún paquete de crates.io (lock vacío, roto o de otro formato) falla cerrado con 2.
+printf 'version = 4\n\n[[package]]\nname = "rp-core"\nversion = "0.1.0"\n' > "$T/vacio.lock"
+correr e vacio && r=0 || r=$?
+esperar "0 paquetes: sale con 2" '[ "$r" = 2 ]'
+correr e no-existe && r=0 || r=$?
+esperar "sin Cargo.lock: sale con 2" '[ "$r" = 2 ]'
 
 # La respuesta queda en el caché: con el fetch roto, sigue andando.
 CHEQUEO_FETCH=/bin/false correr a limpio && r=0 || r=$?
