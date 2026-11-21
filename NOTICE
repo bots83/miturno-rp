@@ -1,0 +1,14 @@
+miturno-rp
+Copyright (C) 2026 MiTurno
+
+Este programa se distribuye bajo la GNU Affero General Public License, versión 3 (ver LICENSE).
+
+Se basa en software de terceros, también bajo AGPL-3.0:
+- chiaki-ng (https://github.com/chiaki-ng/chiaki-ng), cliente de Remote Play de código abierto,
+  derivado de Chiaki (Florian Märkl y colaboradores). Se usa su librería libchiaki, versión v1.10.1.
+- libchiaki (https://github.com/nanpuyue/libchiaki), bindings de Rust de libchiaki, por 南浦月 (nanpuyue).
+- chiaki-stream (https://github.com/nanpuyue/chiaki-stream), por 南浦月 (nanpuyue): base del manejo
+  de la sesión y del multiplexado MPEG-TS de este proyecto.
+
+PlayStation, PS5 y DualSense son marcas de Sony Interactive Entertainment. Este proyecto no está
+afiliado ni avalado por Sony.

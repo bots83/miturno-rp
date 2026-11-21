@@ -1,0 +1,9 @@
+[package]
+name = "miturno-rp"
+description = "Cliente de Remote Play de MiTurno: sesión con la PS5, video sin recomprimir y mandos por WebSocket"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rp-core = { path = "../rp-core" }

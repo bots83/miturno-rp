@@ -1,0 +1,8 @@
+[package]
+name = "rp-core"
+description = "Lógica pura de miturno-rp (credencial, mando, filtro por rol, protocolo); sin libchiaki"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

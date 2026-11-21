@@ -1,0 +1,9 @@
+/target/
+# Nunca secretos en el repo: configuración real y claves viven en /etc/miturno-video del servidor de video.
+*.env
+.env*
+*.pem
+*.key
+*.ini
+*.token
+*.secret

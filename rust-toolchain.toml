@@ -1,0 +1,4 @@
+# Regla del proyecto: versión publicada hace ≥14 días, fijada exacta (1.99.0 es del 28/09/2026).
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"
