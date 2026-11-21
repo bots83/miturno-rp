@@ -25,6 +25,12 @@ miturno-rp [--config /etc/miturno-video/rp.toml] [--casa /etc/miturno-video/casa
 - `casa.env`: `PS5_HOST` (nombre de la conexión de casa; privado, no se registra).
 - `ps5.env` (600): `PS5_REGIST_KEY`, `PS5_MORNING`, `PS5_ACCOUNT_ID` (secretos; nunca se imprimen).
 
+Servidor local (en `http` de `rp.toml`, por defecto `127.0.0.1:7070`; Caddy publica solo `/ctl` y `/control/*`):
+
+- `GET /ctl` (WebSocket): mandos. Primer mensaje `{"t":"auth","token":…}` en menos de 2 s; un solo controlador a la vez (el nuevo de rol igual o mayor reemplaza al anterior); 500 ms sin mensajes, cierre, reemplazo o credencial vencida → todo suelto. Respuestas: `ok`, `error` (`FORMATO`, `FIRMA`, `EMISOR`, `AUDIENCIA`, `VENCIDA`, `ROL`, `OCUPADO`) y `reemplazado`.
+- `POST /interno/auth` (autenticación externa de MediaMTX) y `POST /interno/keyframe`: solo desde la máquina y sin pasar por el proxy.
+- `GET /control/salud` y `POST /control/{reconectar,kick_on,kick_off,reposo,encender}`: con `Authorization: Bearer <token de control>`. `reposo` pone la PS5 en reposo y deja el ciclo en pausa hasta `encender`.
+
 Sin sesión, la salida repite el cartel "Volvemos enseguida" (`/var/lib/miturno-video/cartel.ts`); al conectar, empalma en el primer keyframe de la PS5. Las marcas de tiempo son propias y continuas. Ante SIGTERM cierra la sesión con `session.stop()` antes de salir. `MITURNO_RP_DEPURAR=1` activa el registro de depuración.
 
 ## Compilar

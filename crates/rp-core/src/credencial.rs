@@ -1,5 +1,7 @@
 //! Credencial de turno firmada (JWT EdDSA) que emite la api de MiTurno.
 
+use ed25519_dalek_2::pkcs8::DecodePublicKey;
+use ed25519_dalek_2::VerifyingKey;
 use jsonwebtoken::errors::ErrorKind;
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
@@ -73,17 +75,58 @@ struct Claims {
     jti: String,
 }
 
+/// Clave pública Ed25519 ya parseada y verificada. Se arma una sola vez al arrancar: así una clave del
+/// servidor rota falla temprano con un error claro, en lugar de parecer un error de firma del cliente.
+#[derive(Clone)]
+pub struct ClaveVerificacion(DecodingKey);
+
+/// La clave pública del servidor no es una clave Ed25519 en PEM (SPKI).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ErrorClave;
+
+impl std::fmt::Display for ErrorClave {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("no es una clave pública Ed25519 en PEM (\"BEGIN PUBLIC KEY\")")
+    }
+}
+
+impl std::error::Error for ErrorClave {}
+
+impl ClaveVerificacion {
+    /// Parsea la clave completa (PEM, SPKI, OID de Ed25519 y punto válido de la curva).
+    pub fn desde_pem(pem: &str) -> Result<Self, ErrorClave> {
+        let vk = VerifyingKey::from_public_key_pem(pem.trim()).map_err(|_| ErrorClave)?;
+        // jsonwebtoken guarda la clave Ed como los 32 bytes crudos.
+        Ok(Self(DecodingKey::from_ed_der(vk.as_bytes())))
+    }
+}
+
+impl Credencial {
+    /// Último segundo (Unix) en que `validar` todavía la acepta: `exp` más la tolerancia de reloj.
+    /// Una conexión abierta con esta credencial se corta al llegar a este instante.
+    pub fn vence_s(&self) -> u64 {
+        self.exp.saturating_add(TOLERANCIA_S)
+    }
+}
+
+/// Como `validar_con`, parseando la clave en cada llamada (para tests y herramientas). Una clave
+/// inválida da `Firma`; el servidor usa `ClaveVerificacion::desde_pem` al arrancar.
+pub fn validar(token: &str, clave_publica_pem: &str, ahora_s: u64) -> Result<Credencial, ErrorCredencial> {
+    let clave = ClaveVerificacion::desde_pem(clave_publica_pem).map_err(|_| ErrorCredencial::Firma)?;
+    validar_con(token, &clave, ahora_s)
+}
+
 /// Valida firma (solo EdDSA), emisor, audiencia, vencimiento y rol. El tiempo es `ahora_s`, no el reloj
 /// del sistema, para que sea determinista. La firma se chequea primero; recién después los claims.
-pub fn validar(token: &str, clave_publica_pem: &str, ahora_s: u64) -> Result<Credencial, ErrorCredencial> {
-    let clave = DecodingKey::from_ed_pem(clave_publica_pem.as_bytes()).map_err(|_| ErrorCredencial::Firma)?;
+pub fn validar_con(token: &str, clave: &ClaveVerificacion, ahora_s: u64) -> Result<Credencial, ErrorCredencial> {
+    let clave = &clave.0;
     let mut v = Validation::new(Algorithm::EdDSA);
     // Los claims se chequean a mano abajo: así los errores son precisos y no dependen del reloj.
     v.required_spec_claims.clear();
     v.validate_exp = false;
     v.validate_nbf = false;
     v.validate_aud = false;
-    let datos = decode::<Claims>(token, &clave, &v).map_err(|e| match e.kind() {
+    let datos = decode::<Claims>(token, clave, &v).map_err(|e| match e.kind() {
         ErrorKind::InvalidSignature | ErrorKind::InvalidAlgorithm | ErrorKind::InvalidKeyFormat => {
             ErrorCredencial::Firma
         }
@@ -236,6 +279,42 @@ mod tests {
             c.as_object_mut().unwrap().remove(campo);
             assert_eq!(validar(&firmar(&sk, &c), &pk, AHORA), Err(ErrorCredencial::Formato), "{campo}");
         }
+    }
+
+    #[test]
+    fn validar_con_la_clave_parseada_una_vez() {
+        let (sk, pk) = par(1);
+        let clave = ClaveVerificacion::desde_pem(&pk).unwrap();
+        let t = firmar(&sk, &claims());
+        assert_eq!(validar_con(&t, &clave, AHORA), validar(&t, &pk, AHORA));
+        assert_eq!(validar_con(&t, &clave, AHORA).unwrap().rol, Rol::Operador);
+        let (sk_otra, _) = par(2);
+        assert_eq!(validar_con(&firmar(&sk_otra, &claims()), &clave, AHORA), Err(ErrorCredencial::Firma));
+    }
+
+    #[test]
+    fn clave_del_servidor_invalida_falla_al_parsear_no_como_firma() {
+        let (privada, _) = par(1);
+        // SPKI de X25519 (OID 1.3.101.110): bien formado, pero no es Ed25519.
+        let x25519 = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VuAyEAAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\n-----END PUBLIC KEY-----\n";
+        // SPKI de Ed25519 con la clave cortada (31 bytes).
+        let corta = "-----BEGIN PUBLIC KEY-----\nMCkwBQYDK2VwAyAAAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==\n-----END PUBLIC KEY-----\n";
+        for (nombre, pem) in [("vacía", ""), ("basura", "no es pem"), ("privada", privada.as_str()), ("x25519", x25519), ("corta", corta)] {
+            assert!(ClaveVerificacion::desde_pem(pem).is_err(), "{nombre}");
+        }
+    }
+
+    #[test]
+    fn vence_s_es_el_ultimo_segundo_aceptado() {
+        let (sk, pk) = par(1);
+        let c = validar(&firmar(&sk, &claims()), &pk, AHORA).unwrap();
+        assert_eq!(c.vence_s(), AHORA + 60 + 30);
+        let mut cl = claims();
+        cl["exp"] = json!(AHORA + 10);
+        let t = firmar(&sk, &cl);
+        let c = validar(&t, &pk, AHORA).unwrap();
+        assert!(validar(&t, &pk, c.vence_s()).is_ok());
+        assert_eq!(validar(&t, &pk, c.vence_s() + 1), Err(ErrorCredencial::Vencida));
     }
 
     #[test]

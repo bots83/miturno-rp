@@ -81,7 +81,7 @@ impl fmt::Display for ErrorConfig {
 
 impl std::error::Error for ErrorConfig {}
 
-fn leer(ruta: &Path) -> Result<String, ErrorConfig> {
+pub(crate) fn leer(ruta: &Path) -> Result<String, ErrorConfig> {
     std::fs::read_to_string(ruta).map_err(|e| {
         let motivo = match e.kind() {
             std::io::ErrorKind::NotFound => "no existe".to_string(),
@@ -101,6 +101,9 @@ pub fn parsear_config(texto: &str, ruta: &Path) -> Result<Config, ErrorConfig> {
     let c: Config = toml::from_str(texto).map_err(|e| ErrorConfig(format!("{} inválido: {e}", ruta.display())))?;
     if c.salida_udp.parse::<std::net::SocketAddr>().is_err() {
         return Err(ErrorConfig(format!("{}: salida_udp tiene que ser ip:puerto", ruta.display())));
+    }
+    if c.http.parse::<std::net::SocketAddr>().is_err() {
+        return Err(ErrorConfig(format!("{}: http tiene que ser ip:puerto", ruta.display())));
     }
     if c.bitrate_kbps == 0 {
         return Err(ErrorConfig(format!("{}: bitrate_kbps tiene que ser mayor que 0", ruta.display())));
@@ -293,6 +296,8 @@ token_control = "/etc/miturno-video/control.token"
         assert!(parsear_config(&extra, &r("rp.toml")).is_err());
         let mala = TOML.replace("127.0.0.1:9000", "localhost");
         assert!(parsear_config(&mala, &r("rp.toml")).unwrap_err().0.contains("salida_udp"));
+        let http_malo = TOML.replace("127.0.0.1:7070", "localhost:7070");
+        assert!(parsear_config(&http_malo, &r("rp.toml")).unwrap_err().0.contains("http tiene que ser ip:puerto"));
     }
 
     #[test]

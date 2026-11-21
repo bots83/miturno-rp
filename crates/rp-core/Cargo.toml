@@ -9,6 +9,8 @@ license.workspace = true
 jsonwebtoken = { version = "=11.1.0", default-features = false, features = ["rust_crypto", "use_pem"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
+# La misma versión que usa jsonwebtoken: valida la clave pública completa al arrancar.
+ed25519-dalek-2 = { package = "ed25519-dalek", version = "=2.2.0", default-features = false, features = ["std", "pem"] }
 
 [dev-dependencies]
 ed25519-dalek = { version = "=3.0.0", features = ["pkcs8", "pem"] }

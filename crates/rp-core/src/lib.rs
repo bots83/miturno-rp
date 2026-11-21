@@ -7,7 +7,7 @@ pub mod limitador;
 pub mod mando;
 pub mod protocolo;
 
-pub use credencial::{validar, Credencial, ErrorCredencial, Rol};
+pub use credencial::{validar, validar_con, ClaveVerificacion, Credencial, ErrorClave, ErrorCredencial, Rol};
 pub use filtro::{Filtro, LimitesOptions};
 pub use guardian::Guardian;
 pub use limitador::LimitadorKeyframe;

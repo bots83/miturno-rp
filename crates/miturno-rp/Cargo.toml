@@ -10,10 +10,21 @@ rp-core = { path = "../rp-core" }
 # Bindings de libchiaki (chiaki-ng v1.10.1), fijados por commit. Sin la feature "opus": el audio pasa sin decodificar.
 libchiaki = { git = "https://github.com/nanpuyue/libchiaki", rev = "afe087e", default-features = false }
 mpeg2ts = "=0.6.1"
-tokio = { version = "=1.54.1", features = ["rt", "macros", "time", "sync", "signal"] }
+tokio = { version = "=1.54.1", features = ["rt", "macros", "time", "sync", "signal", "net", "process"] }
+# Servidor HTTP/WebSocket local (/ctl, /interno, /control). Sin tracing ni extractores que no se usan.
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "tokio", "ws"] }
+serde_json = "=1.0.154"
+# Comparación del token de control en tiempo constante.
+subtle = "=2.6.1"
 serde = { version = "=1.0.229", features = ["derive"] }
 toml = { version = "=1.2.1", default-features = false, features = ["std", "parse", "serde"] }
 base64 = "=0.22.1"
 
 [dev-dependencies]
-tokio = { version = "=1.54.1", features = ["rt", "macros", "time", "sync", "signal", "test-util"] }
+tokio = { version = "=1.54.1", features = ["rt", "macros", "time", "sync", "signal", "net", "process", "io-util", "test-util"] }
+# Tests del servidor en memoria: pedidos HTTP con oneshot y un cliente WebSocket sobre un dúplex.
+tower = { version = "=0.5.3", default-features = false, features = ["util"] }
+tokio-tungstenite = { version = "=0.29.0", default-features = false, features = ["handshake"] }
+futures-util = { version = "=0.3.34", default-features = false, features = ["sink"] }
+ed25519-dalek = { version = "=3.0.0", features = ["pkcs8", "pem"] }
+jsonwebtoken = { version = "=11.1.0", default-features = false, features = ["rust_crypto", "use_pem"] }
