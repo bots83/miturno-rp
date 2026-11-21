@@ -1,8 +1,10 @@
 //! Filtro por rol: lo único que separa a un jugador de los menús del sistema de la PS5.
+//! `ahora_ms` debe salir de un reloj monótono (nunca de la hora de pared). Cada mensaje válido del
+//! cliente debe llamar también a `Guardian::latido`.
 //! Un jugador nunca puede apretar PS ni Create (abren menú, tienda, mensajes, perfil: riesgo de ban).
 
 use crate::credencial::Rol;
-use crate::mando::{EstadoMando, CREATE, OPTIONS, PS};
+use crate::mando::{EstadoMando, CONOCIDOS, CREATE, OPTIONS, PS};
 
 /// Límites del botón Options para el rol `Jugador`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +22,8 @@ impl Default for LimitesOptions {
 }
 
 const PROHIBIDOS: u32 = PS | CREATE;
+/// Lo único que puede pasar para un jugador: los bits definidos menos PS y Create.
+const PERMITIDOS_JUGADOR: u32 = CONOCIDOS & !PROHIBIDOS;
 
 #[derive(Debug, Clone)]
 pub struct Filtro {
@@ -51,18 +55,32 @@ impl Filtro {
         }
     }
 
-    /// Devuelve lo que realmente puede llegar a la PS5 según el rol.
+    /// Devuelve lo que realmente puede llegar a la PS5 según el rol. Los bits desconocidos se
+    /// descartan siempre.
+    ///
+    /// Quien llama debe volver a aplicar la última entrada cuando llegue a `vence_en()`: sin
+    /// mensajes nuevos, el filtro no se entera solo de que Options se pasó del máximo apretado.
     pub fn aplicar(&mut self, entrada: &EstadoMando, ahora_ms: u64) -> EstadoMando {
         match self.rol {
-            Rol::Operador => *entrada,
+            Rol::Operador => EstadoMando { botones: entrada.botones & CONOCIDOS, ..*entrada },
             Rol::Vista => EstadoMando::suelto(),
             Rol::Jugador => self.aplicar_jugador(entrada, ahora_ms),
         }
     }
 
-    /// Apretadas descartadas (una por apretada, no por mensaje).
+    /// Apretadas descartadas (una por apretada, no por mensaje). PS y Create apretados juntos
+    /// cuentan 2.
     pub fn descartados(&self) -> u64 {
         self.descartados
+    }
+
+    /// Instante absoluto (`ahora_ms`) en que la salida cambia aunque la entrada no cambie (Options
+    /// apretado llega al máximo y se fuerza suelto), o `None` si no hay nada pendiente.
+    pub fn vence_en(&self) -> Option<u64> {
+        if self.options_bloqueado {
+            return None;
+        }
+        self.options_desde.map(|d| d + self.limites.max_apretado_ms + 1)
     }
 
     fn aplicar_jugador(&mut self, entrada: &EstadoMando, ahora_ms: u64) -> EstadoMando {
@@ -72,7 +90,7 @@ impl Filtro {
         let prohibidos = entrada.botones & PROHIBIDOS;
         self.descartados += u64::from((prohibidos & !self.prohibidos_previos).count_ones());
         self.prohibidos_previos = prohibidos;
-        salida.botones &= !PROHIBIDOS;
+        salida.botones &= PERMITIDOS_JUGADOR;
 
         // Options: limitado en frecuencia y en duración.
         let abajo = entrada.botones & OPTIONS != 0;
@@ -246,5 +264,59 @@ mod tests {
         assert_eq!(f.aplicar(&con(OPTIONS), 10_000).botones, 0);
         assert_eq!(f.aplicar(&con(OPTIONS), 31_000).botones, 0);
         assert_eq!(f.descartados(), 1);
+    }
+
+    #[test]
+    fn vence_en_es_el_inicio_mas_el_maximo_mas_uno() {
+        let mut f = jugador();
+        assert_eq!(f.vence_en(), None);
+        f.aplicar(&con(OPTIONS), 1_000);
+        assert_eq!(f.vence_en(), Some(3_001));
+    }
+
+    #[test]
+    fn vence_en_es_none_tras_forzar_o_soltar() {
+        let mut f = jugador();
+        f.aplicar(&con(OPTIONS), 1_000);
+        f.aplicar(&con(OPTIONS), 3_001);
+        assert_eq!(f.vence_en(), None);
+        f.aplicar(&con(0), 3_002);
+        assert_eq!(f.vence_en(), None);
+        let mut g = jugador();
+        g.aplicar(&con(OPTIONS), 0);
+        g.aplicar(&con(0), 100);
+        assert_eq!(g.vence_en(), None);
+    }
+
+    #[test]
+    fn vence_en_es_none_para_operador_vista_y_toque_descartado() {
+        for rol in [Rol::Operador, Rol::Vista] {
+            let mut f = Filtro::new(rol, LimitesOptions::default());
+            f.aplicar(&con(OPTIONS), 0);
+            assert_eq!(f.vence_en(), None);
+        }
+        let mut f = jugador();
+        toque(&mut f, 0);
+        f.aplicar(&con(OPTIONS), 5_000); // descartado
+        assert_eq!(f.vence_en(), None);
+    }
+
+    #[test]
+    fn reaplicar_la_misma_entrada_en_vence_en_suelta_options() {
+        let mut f = jugador();
+        let e = con(OPTIONS | CRUZ);
+        assert_eq!(f.aplicar(&e, 1_000).botones, OPTIONS | CRUZ);
+        let t = f.vence_en().unwrap();
+        assert_eq!(f.aplicar(&e, t - 1).botones, OPTIONS | CRUZ);
+        assert_eq!(f.aplicar(&e, t).botones, CRUZ);
+        assert_eq!(f.vence_en(), None);
+    }
+
+    #[test]
+    fn bits_desconocidos_nunca_pasan() {
+        let mut f = jugador();
+        assert_eq!(f.aplicar(&con((1 << 16) | (1 << 31) | CRUZ), 0).botones, CRUZ);
+        let mut o = Filtro::new(Rol::Operador, LimitesOptions::default());
+        assert_eq!(o.aplicar(&con((1 << 16) | (1 << 31) | PS | CRUZ), 0).botones, PS | CRUZ);
     }
 }

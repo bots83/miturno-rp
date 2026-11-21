@@ -1,5 +1,6 @@
 //! Mensajes JSON de `/ctl`. El mismo formato lo habla la web (`packages/controls`).
 use crate::credencial::Rol;
+use crate::mando::CONOCIDOS;
 use serde::{Deserialize, Serialize};
 
 /// Lo que manda el cliente (web u operador).
@@ -8,9 +9,9 @@ use serde::{Deserialize, Serialize};
 pub enum MsgCliente {
     Auth { token: String },
     Estado { botones: u32, l2: u8, r2: u8, lx: i16, ly: i16, rx: i16, ry: i16 },
-    Latido,
+    Latido {},
     #[serde(rename = "keyframe")]
-    PedirKeyframe,
+    PedirKeyframe {},
 }
 
 /// Lo que responde el servidor.
@@ -33,8 +34,16 @@ impl MsgServidor {
 }
 
 /// Lee un mensaje del cliente. Campos o tipos desconocidos, y números fuera de rango, son error.
+/// `estado.botones` solo puede usar los 16 bits definidos. Cada mensaje válido debe llamar a
+/// `Guardian::latido`.
 pub fn leer_mensaje(texto: &str) -> Result<MsgCliente, serde_json::Error> {
-    serde_json::from_str(texto)
+    let m: MsgCliente = serde_json::from_str(texto)?;
+    if let MsgCliente::Estado { botones, .. } = &m {
+        if botones & !CONOCIDOS != 0 {
+            return Err(<serde_json::Error as serde::de::Error>::custom("botones con bits desconocidos"));
+        }
+    }
+    Ok(m)
 }
 
 #[cfg(test)]
@@ -62,10 +71,10 @@ mod tests {
 
     #[test]
     fn latido_y_keyframe() {
-        assert_eq!(leer_mensaje(r#"{"t":"latido"}"#).unwrap(), MsgCliente::Latido);
-        assert_eq!(leer_mensaje(r#"{"t":"keyframe"}"#).unwrap(), MsgCliente::PedirKeyframe);
-        assert_eq!(serde_json::to_string(&MsgCliente::Latido).unwrap(), r#"{"t":"latido"}"#);
-        assert_eq!(serde_json::to_string(&MsgCliente::PedirKeyframe).unwrap(), r#"{"t":"keyframe"}"#);
+        assert_eq!(leer_mensaje(r#"{"t":"latido"}"#).unwrap(), MsgCliente::Latido {});
+        assert_eq!(leer_mensaje(r#"{"t":"keyframe"}"#).unwrap(), MsgCliente::PedirKeyframe {});
+        assert_eq!(serde_json::to_string(&MsgCliente::Latido {}).unwrap(), r#"{"t":"latido"}"#);
+        assert_eq!(serde_json::to_string(&MsgCliente::PedirKeyframe {}).unwrap(), r#"{"t":"keyframe"}"#);
     }
 
     #[test]
@@ -117,5 +126,21 @@ mod tests {
         assert!(leer_mensaje(&base("ry", "-32769")).is_err());
         assert!(leer_mensaje(&base("botones", "4294967296")).is_err());
         assert!(leer_mensaje(&base("botones", "-1")).is_err());
+    }
+
+    #[test]
+    fn campos_extra_en_mensajes_sin_cuerpo_son_error() {
+        assert!(leer_mensaje(r#"{"t":"latido","x":1}"#).is_err());
+        assert!(leer_mensaje(r#"{"t":"keyframe","foo":true}"#).is_err());
+    }
+
+    #[test]
+    fn botones_con_bits_fuera_de_0_a_15_son_error() {
+        for b in [1u64 << 16, 1 << 31, u32::MAX as u64] {
+            let j = format!(r#"{{"t":"estado","botones":{b},"l2":0,"r2":0,"lx":0,"ly":0,"rx":0,"ry":0}}"#);
+            assert!(leer_mensaje(&j).is_err(), "botones={b}");
+        }
+        let ok = r#"{"t":"estado","botones":65535,"l2":0,"r2":0,"lx":0,"ly":0,"rx":0,"ry":0}"#;
+        assert!(leer_mensaje(ok).is_ok());
     }
 }

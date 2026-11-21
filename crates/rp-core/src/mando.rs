@@ -18,6 +18,9 @@ pub const ABAJO: u32 = 1 << 13;
 pub const IZQUIERDA: u32 = 1 << 14;
 pub const DERECHA: u32 = 1 << 15;
 
+/// Los 16 bits definidos. Cualquier otro bit es desconocido y nunca llega a la PS5.
+pub const CONOCIDOS: u32 = 0xFFFF;
+
 /// Foto completa del mando. Sticks de -32768 a 32767 (como libchiaki), gatillos de 0 a 255.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct EstadoMando {
@@ -59,6 +62,13 @@ mod tests {
         assert_eq!(ABAJO, 8192);
         assert_eq!(IZQUIERDA, 16384);
         assert_eq!(DERECHA, 32768);
+    }
+
+    #[test]
+    fn conocidos_son_exactamente_los_16_bits_definidos() {
+        let todos = CRUZ | CIRCULO | CUADRADO | TRIANGULO | L1 | R1 | L3 | R3 | OPTIONS | CREATE | PS | PANEL | ARRIBA | ABAJO | IZQUIERDA | DERECHA;
+        assert_eq!(CONOCIDOS, todos);
+        assert_eq!(CONOCIDOS.count_ones(), 16);
     }
 
     #[test]
