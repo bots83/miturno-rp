@@ -1,6 +1,7 @@
 //! `GET /ctl`: el WebSocket de los mandos.
 //!
 //! - El primer mensaje tiene que ser `auth` en menos de 2 s; si no, `error FORMATO` y se cierra.
+//!   Como mucho `MAX_SIN_AUTH` conexiones esperan `auth` a la vez: las demás reciben 503 sin upgrade.
 //! - Un solo controlador a la vez: una conexión válida de rol igual o mayor reemplaza a la anterior
 //!   (que recibe `reemplazado` y se cierra); una de rol menor recibe `error OCUPADO`.
 //! - Cada mensaje válido es un latido. Con 500 ms de silencio se suelta todo (la conexión sigue); al
@@ -22,9 +23,10 @@ use std::time::Duration;
 
 use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
-use axum::response::Response;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use rp_core::{leer_mensaje, validar_con, EstadoMando, Filtro, Guardian, MsgCliente, MsgServidor, Rol};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, OwnedSemaphorePermit};
 use tokio::time::{sleep_until, timeout, Instant};
 
 use super::EstadoServidor;
@@ -39,6 +41,9 @@ pub const SILENCIO_MS: u64 = 500;
 /// error de la api no da más control, y un `exp` enorme no desborda el reloj. Si la api emite
 /// credenciales más largas, hay que subirlo.
 pub const TOPE_CONEXION: Duration = Duration::from_secs(3600 + 30);
+/// Conexiones que pueden estar a la vez esperando `auth` (las demás reciben 503 antes del upgrade).
+/// /ctl es público por Caddy: sin tope, muchas conexiones que nunca se autentican se juntan sin límite.
+pub const MAX_SIN_AUTH: usize = 32;
 /// Tope de un mensaje (una credencial ocupa menos de 1 KiB).
 const MAX_MENSAJE: usize = 4 * 1024;
 /// Plazo para mandar el último mensaje antes de cerrar (un cliente que no lee no traba la tarea).
@@ -113,7 +118,13 @@ impl<S: SesionPs5> Drop for Dueno<S> {
 }
 
 pub(super) async fn ctl<S: SesionPs5>(State(e): State<Arc<EstadoServidor<S>>>, ws: WebSocketUpgrade) -> Response {
-    ws.max_message_size(MAX_MENSAJE).max_frame_size(MAX_MENSAJE).on_upgrade(move |socket| conexion(e, socket))
+    // El lugar se toma antes del upgrade y se suelta al terminar la autenticación (o si el upgrade falla).
+    let Ok(lugar) = e.sin_auth.clone().try_acquire_owned() else {
+        static LIM: crate::registro::Limitado = crate::registro::Limitado::new();
+        crate::limitado!(4, LIM, "ctl: {MAX_SIN_AUTH} conexiones esperando auth; rechazo otra (503)");
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    ws.max_message_size(MAX_MENSAJE).max_frame_size(MAX_MENSAJE).on_upgrade(move |socket| conexion(e, socket, lugar))
 }
 
 enum Leido {
@@ -167,15 +178,23 @@ enum Fin {
     Reemplazada,
 }
 
-async fn conexion<S: SesionPs5>(e: Arc<EstadoServidor<S>>, mut socket: WebSocket) {
+async fn conexion<S: SesionPs5>(e: Arc<EstadoServidor<S>>, mut socket: WebSocket, lugar: OwnedSemaphorePermit) {
     let id = e.proximo_id.fetch_add(1, Ordering::Relaxed);
-    let token = match timeout(PLAZO_AUTH, leer(&mut socket)).await {
-        Ok(Leido::Mensaje(MsgCliente::Auth { token })) => token,
+    // El token vive solo en este brazo: se valida (con la hora de cuando llegó) y se suelta.
+    let (validada, ahora_s) = match timeout(PLAZO_AUTH, leer(&mut socket)).await {
+        Ok(Leido::Mensaje(MsgCliente::Auth { token })) => {
+            let ahora_s = (e.reloj_s)();
+            (validar_con(&token, &e.clave, ahora_s), ahora_s)
+        }
         Ok(Leido::Cerrada) => return,
-        _ => return despedir(socket, Some(MsgServidor::error("FORMATO"))).await,
+        _ => {
+            drop(lugar);
+            return despedir(socket, Some(MsgServidor::error("FORMATO"))).await;
+        }
     };
-    let ahora_s = (e.reloj_s)();
-    let cred = match validar_con(&token, &e.clave, ahora_s) {
+    // Terminó la autenticación (bien o mal): el lugar queda para otra.
+    drop(lugar);
+    let cred = match validada {
         Ok(c) => c,
         Err(err) => {
             static LIM: crate::registro::Limitado = crate::registro::Limitado::new();
@@ -183,7 +202,6 @@ async fn conexion<S: SesionPs5>(e: Arc<EstadoServidor<S>>, mut socket: WebSocket
             return despedir(socket, Some(MsgServidor::error(err.codigo()))).await;
         }
     };
-    drop(token);
     let Some((dueno, mut reemplazo)) = e.tomar(id, cred.rol) else {
         crate::info!("ctl: conexión {id} (rol={}) rechazada: hay un controlador de rol mayor", nombre_rol(cred.rol));
         return despedir(socket, Some(MsgServidor::error("OCUPADO"))).await;

@@ -10,7 +10,7 @@ rp-core = { path = "../rp-core" }
 # Bindings de libchiaki (chiaki-ng v1.10.1), fijados por commit. Sin la feature "opus": el audio pasa sin decodificar.
 libchiaki = { git = "https://github.com/nanpuyue/libchiaki", rev = "afe087e", default-features = false }
 mpeg2ts = "=0.6.1"
-tokio = { version = "=1.54.1", features = ["rt", "macros", "time", "sync", "signal", "net", "process"] }
+tokio = { version = "=1.54.1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "signal", "net", "process"] }
 # Servidor HTTP/WebSocket local (/ctl, /interno, /control). Sin tracing ni extractores que no se usan.
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "tokio", "ws"] }
 serde_json = "=1.0.154"

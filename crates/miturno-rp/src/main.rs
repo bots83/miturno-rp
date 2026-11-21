@@ -1,6 +1,8 @@
 //! miturno-rp: mantiene la sesión con la PS5 y saca su video sin recomprimir como MPEG-TS por UDP.
 //! Sin sesión, la salida muestra el cartel "Volvemos enseguida" para que nunca se corte.
-//! El servidor local (`/ctl`, `/interno/*`, `/control/*`) corre en el mismo runtime que el ciclo.
+//! El servidor local (`/ctl`, `/interno/*`, `/control/*`) corre en el mismo runtime que el ciclo, pero
+//! en sus dos hilos de trabajo: el ciclo (y el mux) corre en el hilo principal, así una ráfaga de
+//! conexiones a /ctl o de pedidos de salud no le quita tiempo a la salida de video.
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -51,7 +53,8 @@ fn correr(rutas: Rutas) -> Result<(), String> {
     let token_control = servidor::cargar_token_control(&config.token_control)?;
     let http: std::net::SocketAddr = config.http.parse().expect("validada al cargar la configuración");
 
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .map_err(|e| format!("no pude crear el runtime: {e}"))?;
@@ -72,6 +75,7 @@ fn correr(rutas: Rutas) -> Result<(), String> {
         // La pausa (consola tomada o reposo) sobrevive a un reinicio: si quedó guardada, se arranca en ella.
         let enlace = enlace.con_pausa(config.pausa.clone());
         // Todo en este runtime (nada de hilos propios con la sesión): un pánico llega al Drop de la sesión.
+        // `block_on` corre el ciclo en este hilo; lo que se lanza con `spawn` va a los hilos de trabajo.
         let estado = EstadoServidor::new(Piezas {
             sesion: sesion.clone(),
             clave,

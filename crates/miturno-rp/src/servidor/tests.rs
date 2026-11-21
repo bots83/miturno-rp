@@ -583,6 +583,38 @@ async fn ctl_exp_enorme_no_entra_en_panico_y_se_corta_al_tope() {
     assert!(tardo >= ctl::TOPE_CONEXION - Duration::from_millis(10) && tardo <= ctl::TOPE_CONEXION, "{tardo:?}");
 }
 
+/// Intenta el handshake de `/ctl`: `Err` con el código HTTP si el servidor no lo acepta.
+async fn handshake(b: &Banco) -> Result<Ws, u16> {
+    let (cli, srv) = tokio::io::duplex(64 * 1024);
+    b.conexiones.send((srv, local())).await.unwrap();
+    match tokio_tungstenite::client_async("ws://127.0.0.1:7070/ctl", cli).await {
+        Ok((ws, _)) => Ok(ws),
+        Err(tokio_tungstenite::tungstenite::Error::Http(r)) => Err(r.status().as_u16()),
+        Err(e) => panic!("handshake: {e}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn ctl_con_32_conexiones_esperando_auth_la_siguiente_recibe_503() {
+    // /ctl es público: muchas conexiones que nunca se autentican no pueden juntarse sin tope.
+    let b = banco();
+    let mut colgadas = Vec::new();
+    for _ in 0..ctl::MAX_SIN_AUTH {
+        colgadas.push(handshake(&b).await.expect("dentro del tope"));
+    }
+    assert_eq!(handshake(&b).await.err(), Some(503));
+    // Al vencer el plazo de auth se cierran y liberan el lugar.
+    sleep(ctl::PLAZO_AUTH + Duration::from_millis(50)).await;
+    let mut ws = handshake(&b).await.expect("con lugar de nuevo");
+    enviar(&mut ws, json!({"t":"auth","token":token("operador")})).await;
+    assert_eq!(recibir(&mut ws).await, Some(json!({"t":"ok","rol":"operador"})));
+    // Una conexión ya autenticada no ocupa lugar: entran otras 32 sin autenticar.
+    for _ in 0..ctl::MAX_SIN_AUTH {
+        colgadas.push(handshake(&b).await.expect("la autenticada no cuenta"));
+    }
+    assert_eq!(handshake(&b).await.err(), Some(503));
+}
+
 #[tokio::test(start_paused = true)]
 async fn ctl_una_credencial_mas_larga_que_las_de_la_api_se_corta_a_la_hora_y_30_s() {
     // Las credenciales de la api duran 1 h: un `exp` más largo (un error de la api) no da más control.
