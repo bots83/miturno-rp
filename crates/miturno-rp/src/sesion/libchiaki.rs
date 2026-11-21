@@ -153,19 +153,27 @@ pub fn a_chiaki(e: &EstadoMando) -> ControllerState {
     s
 }
 
+/// Sin comodín a propósito: si una versión nueva de libchiaki agrega un motivo, esto deja de compilar
+/// y hay que decidir a mano (sobre todo, que no caiga en `TomadaLocal` sin querer).
 pub fn motivo(r: QuitReason) -> MotivoCierre {
     use ffi::ChiakiQuitReason::*;
     match r {
         CHIAKI_QUIT_REASON_SESSION_REQUEST_RP_IN_USE => MotivoCierre::EnUso,
+        // CTRL_UNKNOWN también sale con una red inestable (el control se corta sin más): es Red.
         CHIAKI_QUIT_REASON_SESSION_REQUEST_UNKNOWN
         | CHIAKI_QUIT_REASON_SESSION_REQUEST_CONNECTION_REFUSED
+        | CHIAKI_QUIT_REASON_CTRL_UNKNOWN
         | CHIAKI_QUIT_REASON_CTRL_CONNECT_FAILED
         | CHIAKI_QUIT_REASON_CTRL_CONNECTION_REFUSED
         | CHIAKI_QUIT_REASON_STREAM_CONNECTION_UNKNOWN
         | CHIAKI_QUIT_REASON_STREAM_CONNECTION_REMOTE_DISCONNECTED => MotivoCierre::Red,
         // Solo sale si la PS5 manda el texto exacto "Server shutting down" (chiaki-ng, session.c).
         CHIAKI_QUIT_REASON_STREAM_CONNECTION_REMOTE_SHUTDOWN => MotivoCierre::TomadaLocal,
-        _ => MotivoCierre::Otro,
+        CHIAKI_QUIT_REASON_NONE
+        | CHIAKI_QUIT_REASON_STOPPED
+        | CHIAKI_QUIT_REASON_SESSION_REQUEST_RP_CRASH
+        | CHIAKI_QUIT_REASON_SESSION_REQUEST_RP_VERSION_MISMATCH
+        | CHIAKI_QUIT_REASON_PSN_REGIST_FAILED => MotivoCierre::Otro,
     }
 }
 
@@ -176,6 +184,9 @@ fn describir_cierre(r: QuitReason, reason_str: &str) -> String {
     let texto = if reason_str.is_empty() { "sin texto de la PS5".to_owned() } else { format!("texto de la PS5: {:?}", ocultar(reason_str)) };
     format!("{:?} = {} ({:?}); {texto}; motivo {:?}", r, r as u32, libchiaki::quit_reason_string(r), motivo(r))
 }
+
+/// Con la PS5 trabada en EnUso, el fin de cada intento sale en el registro como mucho una vez por minuto.
+static TERMINO_EN_USO: crate::registro::Limitado = crate::registro::Limitado::new();
 
 /// Textos privados (el nombre de casa) que se tapan en el registro de libchiaki.
 static OCULTAR: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -267,7 +278,13 @@ fn abrir<'a>(
                 // siempre después de liberar esta sesión.
                 let _ = cmd.send(Cmd::Terminada(numero));
                 if !a_pedido.load(Ordering::SeqCst) {
-                    crate::info!("sesión: terminó: {}", describir_cierre(reason, &reason_str));
+                    let texto = describir_cierre(reason, &reason_str);
+                    if motivo(reason) == MotivoCierre::EnUso {
+                        // Siempre el mismo texto y el ciclo ya registra cada reintento: uno por minuto.
+                        crate::limitado!(6, TERMINO_EN_USO, "sesión: terminó: {texto}");
+                    } else {
+                        crate::info!("sesión: terminó: {texto}");
+                    }
                     avisar(&ev, EventoSesion::Cerrada { motivo: motivo(reason) });
                 }
             }
@@ -558,8 +575,49 @@ mod tests {
         assert!(d.contains("sin texto de la PS5"), "{d}");
         assert!(d.ends_with("motivo EnUso"), "{d}");
 
-        let d = describir_cierre(CHIAKI_QUIT_REASON_CTRL_UNKNOWN, "");
-        assert!(d.contains("CHIAKI_QUIT_REASON_CTRL_UNKNOWN = 7") && d.ends_with("motivo Otro"), "{d}");
+        let d = describir_cierre(CHIAKI_QUIT_REASON_SESSION_REQUEST_RP_VERSION_MISMATCH, "");
+        assert!(d.contains("CHIAKI_QUIT_REASON_SESSION_REQUEST_RP_VERSION_MISMATCH = 6") && d.ends_with("motivo Otro"), "{d}");
+    }
+
+    /// Todos los `ChiakiQuitReason` de libchiaki 1.10.1, en orden.
+    const TODOS: [QuitReason; 14] = {
+        use ffi::ChiakiQuitReason::*;
+        [
+            CHIAKI_QUIT_REASON_NONE,
+            CHIAKI_QUIT_REASON_STOPPED,
+            CHIAKI_QUIT_REASON_SESSION_REQUEST_UNKNOWN,
+            CHIAKI_QUIT_REASON_SESSION_REQUEST_CONNECTION_REFUSED,
+            CHIAKI_QUIT_REASON_SESSION_REQUEST_RP_IN_USE,
+            CHIAKI_QUIT_REASON_SESSION_REQUEST_RP_CRASH,
+            CHIAKI_QUIT_REASON_SESSION_REQUEST_RP_VERSION_MISMATCH,
+            CHIAKI_QUIT_REASON_CTRL_UNKNOWN,
+            CHIAKI_QUIT_REASON_CTRL_CONNECT_FAILED,
+            CHIAKI_QUIT_REASON_CTRL_CONNECTION_REFUSED,
+            CHIAKI_QUIT_REASON_STREAM_CONNECTION_UNKNOWN,
+            CHIAKI_QUIT_REASON_STREAM_CONNECTION_REMOTE_DISCONNECTED,
+            CHIAKI_QUIT_REASON_STREAM_CONNECTION_REMOTE_SHUTDOWN,
+            CHIAKI_QUIT_REASON_PSN_REGIST_FAILED,
+        ]
+    };
+
+    #[test]
+    fn solo_remote_shutdown_lleva_a_tomada_local() {
+        use ffi::ChiakiQuitReason::*;
+        // La lista está completa: los valores van de 0 al último sin saltos (si libchiaki agrega uno,
+        // `motivo` deja de compilar, porque el match no tiene comodín).
+        for (i, r) in TODOS.iter().enumerate() {
+            assert_eq!(*r as usize, i, "{r:?}");
+        }
+        for r in TODOS {
+            let m = motivo(r);
+            assert_eq!(m == MotivoCierre::TomadaLocal, r == CHIAKI_QUIT_REASON_STREAM_CONNECTION_REMOTE_SHUTDOWN, "{r:?} → {m:?}");
+        }
+    }
+
+    #[test]
+    fn ctrl_unknown_es_red() {
+        // Puede salir con una red inestable: tiene que reintentar rápido, no con la espera de Otra.
+        assert_eq!(motivo(ffi::ChiakiQuitReason::CHIAKI_QUIT_REASON_CTRL_UNKNOWN), MotivoCierre::Red);
     }
 
     #[test]
