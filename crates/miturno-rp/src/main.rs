@@ -90,7 +90,7 @@ fn correr(rutas: Rutas) -> Result<(), String> {
             cartel.video.len(),
             config.bitrate_kbps
         );
-        ciclo::correr(sesion, perfil, Salida::new(cartel, destino, salida::origen_del_reloj()), senales, enlace).await;
+        ciclo::correr(sesion, perfil, Salida::new(cartel, destino, salida::origen_del_reloj()), senales, enlace).await?;
         info!("miturno-rp: listo");
         Ok(())
     })

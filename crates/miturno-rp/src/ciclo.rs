@@ -147,8 +147,11 @@ fn sincronizar(metricas: &Metricas, estado: &Estado, anterior: &mut EstadoSesion
     }
 }
 
-/// Corre hasta que `senales` se complete (SIGTERM o SIGINT en `main`).
-pub async fn correr<S, D, F>(sesion: Arc<S>, perfil: Perfil, mut salida: Salida<D>, senales: F, enlace: Enlace)
+/// Corre hasta que `senales` se complete (SIGTERM o SIGINT en `main`): entonces devuelve `Ok`.
+/// Devuelve `Err` si la sesión ya no puede funcionar (murió el hilo de libchiaki o se cerró su canal
+/// de eventos): reintentar dejaría el cartel para siempre, así que `main` sale con error y systemd lo
+/// reinicia (`Restart=always`).
+pub async fn correr<S, D, F>(sesion: Arc<S>, perfil: Perfil, mut salida: Salida<D>, senales: F, enlace: Enlace) -> Result<(), String>
 where
     S: SesionPs5,
     D: Destino,
@@ -160,8 +163,7 @@ where
     let mut en_metricas = EstadoSesion::Caida;
     metricas.estado(en_metricas);
     let Some(mut eventos) = sesion.eventos() else {
-        crate::falla!("ciclo: el canal de eventos de la sesión ya estaba tomado");
-        return;
+        return Err("ciclo: el canal de eventos de la sesión ya estaba tomado".into());
     };
     tokio::pin!(senales);
     // Si quedó una pausa guardada (miturno-rp se reinició con la consola tomada o en reposo), se
@@ -205,13 +207,12 @@ where
                 if tokio::time::timeout(PLAZO_DETENER, sesion.detener()).await.is_err() {
                     crate::aviso!("ciclo: la sesión no cerró en {} s; salgo igual", PLAZO_DETENER.as_secs());
                 }
-                return;
+                return Ok(());
             }
             ev = eventos.recv() => {
                 let Some(ev) = ev else {
-                    crate::falla!("ciclo: se cerró el canal de eventos de la sesión");
                     let _ = tokio::time::timeout(PLAZO_DETENER, sesion.detener()).await;
-                    return;
+                    return Err("ciclo: se cerró el canal de eventos de la sesión".into());
                 };
                 let ahora = Instant::now();
                 match ev {
@@ -333,10 +334,9 @@ where
                 match estado {
                     Estado::Esperando { despertar, .. } => {
                         intento += 1;
+                        // El único error es que murió el hilo de libchiaki: sin él no hay sesión posible.
                         if despertar {
-                            if let Err(e) = sesion.despertar(&perfil) {
-                                crate::falla!("ciclo: no pude despertar la PS5: {e}");
-                            }
+                            sesion.despertar(&perfil).map_err(|e| format!("ciclo: no pude despertar la PS5: {e}; salgo para que systemd me reinicie"))?;
                         }
                         estado = match sesion.conectar(&perfil) {
                             Ok(()) => {
@@ -348,9 +348,7 @@ where
                                 Estado::Conectando { desde: Instant::now() }
                             }
                             Err(e) => {
-                                // No hay con quién hablar (murió el hilo de libchiaki): espera larga.
-                                crate::falla!("ciclo: no pude iniciar la sesión: {e}");
-                                reintentar(&mut reintentos, Causa::Otra)
+                                return Err(format!("ciclo: no pude iniciar la sesión: {e}; salgo para que systemd me reinicie"));
                             }
                         };
                     }
@@ -430,7 +428,7 @@ mod tests {
         metricas: Arc<Metricas>,
         salida: Compartido,
         terminar: Option<oneshot::Sender<()>>,
-        tarea: tokio::task::JoinHandle<()>,
+        tarea: tokio::task::JoinHandle<Result<(), String>>,
         t0: Instant,
     }
 
@@ -472,7 +470,7 @@ mod tests {
         async fn terminar(mut self) -> (Self, Duration) {
             let t = Instant::now();
             self.terminar.take().unwrap().send(()).unwrap();
-            (&mut self.tarea).await.unwrap();
+            (&mut self.tarea).await.unwrap().unwrap();
             (self, t.elapsed())
         }
         fn videos(&self) -> Vec<(u64, Vec<u8>)> {
@@ -606,13 +604,26 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn hilo_terminado_espera_hasta_30_s() {
-        let b = arrancar(vec![]);
+    async fn hilo_terminado_sale_con_error_para_que_systemd_reinicie() {
+        // Sin el hilo de libchiaki no hay sesión posible: reintentar dejaría el cartel para siempre.
+        // Sale con error (systemd lo reinicia en 2 s, Restart=always) y sin cerrar la salida a medias.
+        let mut b = arrancar(vec![]);
         b.sesion.interna().romper();
-        sleep(Duration::from_secs(95)).await;
-        let t = b.segundos(&b.registro().conectar);
-        assert_eq!(t, vec![0.0, 1.0, 3.0, 7.0, 15.0, 31.0, 61.0, 91.0]);
-        b.terminar().await;
+        let r = tokio::time::timeout(Duration::from_secs(5), &mut b.tarea).await;
+        let r = r.expect("el ciclo tiene que terminar solo").unwrap();
+        assert!(r.as_ref().is_err_and(|e| e.contains("hilo de la sesión")), "{r:?}");
+        let r = b.registro();
+        assert_eq!((r.despertar.len(), r.conectar.len()), (1, 0), "no reintenta");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn si_el_hilo_muere_con_la_sesion_arriba_tambien_sale_con_error_al_reintentar() {
+        let mut b = arrancar(vec![vec![EventoSesion::Conectada]]);
+        sleep(Duration::from_secs(2)).await;
+        b.sesion.interna().romper();
+        b.orden(Orden::Reconectar).await;
+        let r = tokio::time::timeout(Duration::from_secs(5), &mut b.tarea).await.expect("termina").unwrap();
+        assert!(r.is_err(), "{r:?}");
     }
 
     #[tokio::test(start_paused = true)]
