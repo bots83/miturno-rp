@@ -3,6 +3,10 @@
 # Lee /etc/miturno-video/{rp.toml,casa.env,ps5.env,control.token,ct-public.pem} y el cartel de
 # /var/lib/miturno-video (root:rp 640); el resto de /etc/miturno-video (kick.env, telegram.env,
 # turn.secret) queda root 600 y no lo ve.
+# Escribe solo en /var/lib/miturno-rp (StateDirectory, rp:rp 0700): el archivo `pausa` guarda si la
+# consola quedó tomada en forma local o en reposo, para que un reinicio (Restart=always tras un
+# pánico, un despliegue o un reinicio del servidor) no la retome ni la despierte. Se borra con
+# /control/reconectar o /control/encender. Para forzar que retome al arrancar: borrar ese archivo.
 [Unit]
 Description=MiTurno: miturno-rp (sesión con la PS5, mandos y control)
 After=network-online.target mediamtx.service
@@ -27,6 +31,9 @@ RestartMaxDelaySec=30
 NoNewPrivileges=true
 CapabilityBoundingSet=
 ProtectSystem=strict
+# Con ProtectSystem=strict, el StateDirectory es lo único escribible (lo crea systemd con dueño rp).
+StateDirectory=miturno-rp
+StateDirectoryMode=0700
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true

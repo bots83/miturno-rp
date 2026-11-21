@@ -4,17 +4,21 @@
 //! muerto…), creciente hasta 30 s. Mientras tanto la salida nunca se corta: muestra el cartel.
 //! Si la PS5 cierra la sesión ella misma ("Server shutting down": alguien usa la consola en forma
 //! local), no la retoma: queda en `TomadaLocal`, con el cartel, hasta `/control/reconectar`.
+//! Las dos pausas (`TomadaLocal` y `Reposo`) se guardan en disco (`crate::pausa`): un reinicio de
+//! miturno-rp arranca en la misma pausa, sin despertar ni conectar.
 //! Ante SIGTERM cierra la sesión con `session.stop()` (vía `detener()`) y termina en menos de 5 s.
 //! Recibe órdenes del servidor (`/control/*`): reconectar, reposo (la PS5 se apaga y el ciclo queda en
 //! pausa, si no la volvería a despertar) y encender (sale de la pausa). Escribe las métricas de la salud.
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use crate::config::Perfil;
 use crate::metricas::{EstadoSesion, Metricas};
 use crate::mux::Destino;
+use crate::pausa::{self, Pausa};
 use crate::salida::Salida;
 use crate::sesion::{EventoSesion, MotivoCierre, SesionPs5};
 use rp_core::reintento::ESPERA_INICIAL;
@@ -39,7 +43,8 @@ pub const PLAZO_REPOSO: Duration = Duration::from_secs(10);
 pub enum Orden {
     /// Cierra la sesión (si hay) y reintenta enseguida. En reposo no hace nada: para eso está `Encender`.
     Reconectar,
-    /// Pone la PS5 en reposo (si hay sesión) y deja el ciclo en pausa.
+    /// Pone la PS5 en reposo (si hay sesión) y deja el ciclo en pausa. Con la consola tomada no hay
+    /// sesión: no la apaga (alguien la usa), solo pasa la pausa a reposo.
     Reposo,
     /// Sale de la pausa (despertar + conectar ya). Si el ciclo estaba esperando, adelanta el intento.
     Encender,
@@ -49,13 +54,20 @@ pub enum Orden {
 pub struct Enlace {
     pub ordenes: mpsc::Receiver<Orden>,
     pub metricas: Arc<Metricas>,
+    /// Dónde se guarda la pausa (`crate::pausa`). Sin ruta, la pausa vive solo en memoria.
+    pub pausa: Option<PathBuf>,
 }
 
 impl Enlace {
     /// El enlace y el `Sender` de órdenes que se le pasa al servidor.
     pub fn nuevo(metricas: Arc<Metricas>) -> (mpsc::Sender<Orden>, Enlace) {
         let (tx, ordenes) = mpsc::channel(16);
-        (tx, Enlace { ordenes, metricas })
+        (tx, Enlace { ordenes, metricas, pausa: None })
+    }
+
+    /// Guarda la pausa en `ruta` y la lee de ahí al arrancar.
+    pub fn con_pausa(self, ruta: PathBuf) -> Enlace {
+        Enlace { pausa: Some(ruta), ..self }
     }
 }
 
@@ -91,7 +103,36 @@ impl Estado {
             Estado::TomadaLocal => EstadoSesion::TomadaLocal,
         }
     }
+
+    fn pausa(&self) -> Option<Pausa> {
+        match self {
+            Estado::TomadaLocal => Some(Pausa::Tomada),
+            Estado::Reposo { .. } => Some(Pausa::Reposo),
+            Estado::Esperando { .. } | Estado::Conectando { .. } | Estado::Conectada { .. } => None,
+        }
+    }
 }
+
+/// Guarda o borra la pausa del archivo si cambió. Si no se puede escribir, el ciclo sigue igual (la
+/// pausa en memoria vale) y se registra: un reinicio la perdería.
+fn persistir(ruta: Option<&std::path::Path>, estado: &Estado, guardada: &mut Option<Pausa>) {
+    let Some(ruta) = ruta else { return };
+    let nueva = estado.pausa();
+    if nueva == *guardada {
+        return;
+    }
+    let r = match nueva {
+        Some(p) => pausa::guardar(ruta, p),
+        None => pausa::borrar(ruta),
+    };
+    if let Err(e) = r {
+        crate::falla!("ciclo: no pude actualizar la pausa en {}: {e} (si miturno-rp se reinicia, no la va a recordar)", ruta.display());
+    }
+    *guardada = nueva;
+}
+
+/// Con la PS5 trabada en EnUso, el aviso de cada reintento sale como mucho una vez por minuto.
+static EN_USO_ESPACIADO: crate::registro::Limitado = crate::registro::Limitado::new();
 
 /// Pasa a las métricas el estado del ciclo si cambió (y la hora de la conexión, si se conectó).
 fn sincronizar(metricas: &Metricas, estado: &Estado, anterior: &mut EstadoSesion) {
@@ -114,7 +155,7 @@ where
     F: Future<Output = ()>,
 {
     let t0 = Instant::now();
-    let Enlace { mut ordenes, metricas } = enlace;
+    let Enlace { mut ordenes, metricas, pausa: ruta_pausa } = enlace;
     let mut ordenes_abiertas = true;
     let mut en_metricas = EstadoSesion::Caida;
     metricas.estado(en_metricas);
@@ -123,14 +164,29 @@ where
         return;
     };
     tokio::pin!(senales);
-    let mut estado = Estado::Esperando { hasta: t0, despertar: true };
+    // Si quedó una pausa guardada (miturno-rp se reinició con la consola tomada o en reposo), se
+    // arranca en ella: ni se despierta ni se conecta.
+    let mut guardada = ruta_pausa.as_deref().and_then(pausa::cargar);
+    let mut estado = match guardada {
+        Some(Pausa::Tomada) => {
+            crate::aviso!("ciclo: arranco con la consola tomada en forma local (pausa guardada); no la retomo hasta /control/reconectar");
+            Estado::TomadaLocal
+        }
+        Some(Pausa::Reposo) => {
+            crate::aviso!("ciclo: arranco en reposo (pausa guardada); no despierto la PS5 hasta /control/encender");
+            Estado::Reposo { cerrar_en: None }
+        }
+        None => Estado::Esperando { hasta: t0, despertar: true },
+    };
     let mut reintentos = Reintentos::new();
     let mut intento = 0u64;
 
     // Pasa a esperar el próximo intento; la espera (y si se despierta) depende del motivo.
     let reintentar = |reintentos: &mut Reintentos, causa: Causa| -> Estado {
         let e = reintentos.proxima(causa);
-        if causa == Causa::EnUso {
+        if causa == Causa::EnUso && reintentos.en_uso_espaciado() {
+            crate::limitado!(6, EN_USO_ESPACIADO, "ciclo: la PS5 sigue con otra sesión abierta (EnUso) hace más de 2 min; reintento cada {} s sin despertarla", e.dura.as_secs());
+        } else if causa == Causa::EnUso {
             crate::info!("ciclo: la PS5 tiene otra sesión abierta (EnUso); reintento en {} s sin despertarla", e.dura.as_secs());
         } else {
             crate::info!("ciclo: reintento en {} s (motivo: {causa:?})", e.dura.as_secs());
@@ -195,7 +251,11 @@ where
                             Estado::Esperando { .. } | Estado::Reposo { .. } | Estado::TomadaLocal => None,
                         };
                         if let Some(duro) = duro {
-                            crate::info!("ciclo: la sesión terminó ({motivo:?}) después de {} s", duro.as_secs());
+                            if motivo == MotivoCierre::EnUso && reintentos.en_uso_espaciado() {
+                                crate::depurar!("ciclo: la sesión terminó (EnUso)");
+                            } else {
+                                crate::info!("ciclo: la sesión terminó ({motivo:?}) después de {} s", duro.as_secs());
+                            }
                             salida.sesion_caida(t0.elapsed());
                             if duro >= SESION_ESTABLE {
                                 reintentos.reiniciar();
@@ -218,6 +278,12 @@ where
                 let ahora = Instant::now();
                 match (orden, &estado) {
                     (Orden::Reposo, Estado::Reposo { .. }) => crate::info!("ciclo: reposo pedido, pero ya estaba en reposo"),
+                    (Orden::Reposo, Estado::TomadaLocal) => {
+                        // No hay sesión con la que mandarla a dormir y alguien la está usando: no se apaga.
+                        // El ciclo queda en pausa (no la retoma) hasta encender.
+                        crate::aviso!("ciclo: reposo pedido con la consola tomada en forma local; no la apago (no hay sesión), el ciclo queda en pausa hasta encender");
+                        estado = Estado::Reposo { cerrar_en: None };
+                    }
                     (Orden::Reposo, _) => {
                         sesion.reposo();
                         estado = if let Estado::Conectada { .. } = estado {
@@ -274,7 +340,11 @@ where
                         }
                         estado = match sesion.conectar(&perfil) {
                             Ok(()) => {
-                                crate::info!("ciclo: conectando (intento {intento})");
+                                if reintentos.en_uso_espaciado() {
+                                    crate::depurar!("ciclo: conectando (intento {intento})");
+                                } else {
+                                    crate::info!("ciclo: conectando (intento {intento})");
+                                }
                                 Estado::Conectando { desde: Instant::now() }
                             }
                             Err(e) => {
@@ -312,6 +382,7 @@ where
             }
         }
         sincronizar(&metricas, &estado, &mut en_metricas);
+        persistir(ruta_pausa.as_deref(), &estado, &mut guardada);
         // Mientras se muestra el cartel con la sesión arriba, se pide un keyframe (el limitador deja uno cada 3 s).
         if let Estado::Conectada { .. } = estado {
             if salida.en_cartel() && sesion.pedir_keyframe() {
@@ -364,11 +435,20 @@ mod tests {
     }
 
     fn arrancar(guion: Vec<Vec<EventoSesion>>) -> Banco {
+        arrancar_con(guion, None)
+    }
+
+    /// Con `pausa`, el ciclo guarda ahí la pausa (consola tomada o reposo) y la lee al arrancar.
+    fn arrancar_con(guion: Vec<Vec<EventoSesion>>, pausa: Option<std::path::PathBuf>) -> Banco {
         let sesion = Arc::new(ConLimite::new(SesionFalsa::con_guion(guion), 3_000));
         let salida = Compartido::default();
         let (tx, rx) = oneshot::channel::<()>();
         let metricas = Arc::new(Metricas::new());
         let (ordenes, enlace) = Enlace::nuevo(metricas.clone());
+        let enlace = match pausa {
+            Some(ruta) => enlace.con_pausa(ruta),
+            None => enlace,
+        };
         let tarea = tokio::spawn(correr(
             sesion.clone(),
             perfil(),
@@ -746,14 +826,202 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn reposo_con_la_consola_tomada_pasa_a_reposo() {
+    async fn reposo_con_la_consola_tomada_pausa_sin_apagarla() {
+        // Alguien la está usando y no hay sesión: no se apaga, el ciclo queda en pausa hasta encender.
         let b = tomada_a_los_2_s(vec![]).await;
         b.orden(Orden::Reposo).await;
-        assert_eq!(b.registro().reposo, 1);
+        assert_eq!(b.registro().reposo, 0, "no se le pide reposo a la PS5");
         assert_eq!(b.estado(), EstadoSesion::Reposo);
         b.orden(Orden::Reconectar).await;
         assert_eq!(b.registro().conectar.len(), 1, "en reposo, reconectar no hace nada");
+        sleep(Duration::from_secs(60)).await;
+        assert_eq!((b.registro().despertar.len(), b.registro().conectar.len()), (1, 1));
         b.terminar().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tomada_local_mientras_conecta_tampoco_se_retoma() {
+        let tomada = vec![EventoSesion::Cerrada { motivo: MotivoCierre::TomadaLocal }];
+        let b = arrancar(vec![tomada, vec![EventoSesion::Conectada]]);
+        sleep(Duration::from_millis(10)).await;
+        assert_eq!(b.estado(), EstadoSesion::TomadaLocal);
+        sleep(Duration::from_secs(120)).await;
+        let r = b.registro();
+        assert_eq!((r.despertar.len(), r.conectar.len()), (1, 1), "ni despierta ni conecta solo");
+        assert_eq!(b.estado(), EstadoSesion::TomadaLocal);
+        b.terminar().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn en_uso_seguido_se_espacia_a_15_s_despues_de_2_minutos() {
+        let en_uso = vec![EventoSesion::Cerrada { motivo: MotivoCierre::EnUso }];
+        let b = arrancar(vec![en_uso; 50]);
+        sleep(Duration::from_secs(160)).await;
+        let r = b.registro();
+        let d = diferencias(&b.segundos(&r.conectar));
+        assert_eq!(d.len(), 42, "{d:?}");
+        assert!(d[..40].iter().all(|&x| x == 3.0), "{d:?}");
+        assert_eq!(d[40..], [15.0, 15.0], "{d:?}");
+        assert_eq!(r.despertar.len(), 1, "sin despertar");
+        // Reconectar corta la racha: vuelve a 3 s.
+        b.orden(Orden::Reconectar).await;
+        sleep(Duration::from_secs(4)).await;
+        let t = b.segundos(&b.registro().conectar);
+        assert_eq!(diferencias(&t[t.len() - 2..]), vec![3.0], "{t:?}");
+        b.terminar().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn despues_de_muchas_caidas_de_red_otro_motivo_espera_1_s() {
+        let red = || vec![EventoSesion::Cerrada { motivo: MotivoCierre::Red }];
+        let otro = || vec![EventoSesion::Cerrada { motivo: MotivoCierre::Otro }];
+        let b = arrancar(vec![red(), red(), red(), red(), red(), red(), otro(), otro()]);
+        sleep(Duration::from_secs(30)).await;
+        let t = b.segundos(&b.registro().conectar);
+        assert_eq!(diferencias(&t[..8]), vec![1.0, 2.0, 4.0, 5.0, 5.0, 5.0, 1.0], "{t:?}");
+        b.terminar().await;
+    }
+
+    /// Un directorio vacío y propio de cada test para el archivo de pausa.
+    fn dir_de_prueba(nombre: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("miturno-rp-ciclo-{}-{nombre}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn leer_pausa(ruta: &std::path::Path) -> Option<String> {
+        std::fs::read_to_string(ruta).ok().map(|s| s.trim().to_owned())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn un_reinicio_no_retoma_la_consola_tomada() {
+        let dir = dir_de_prueba("reinicio-tomada");
+        let ruta = dir.join("pausa");
+        let mut guion = vec![vec![EventoSesion::Conectada]];
+        guion.push(vec![EventoSesion::Conectada]);
+        let b = arrancar_con(guion, Some(ruta.clone()));
+        sleep(Duration::from_secs(2)).await;
+        b.emisor().send(EventoSesion::Cerrada { motivo: MotivoCierre::TomadaLocal }).await.unwrap();
+        sleep(Duration::from_millis(1)).await;
+        assert_eq!(leer_pausa(&ruta).as_deref(), Some("tomada"), "la pausa queda guardada");
+        b.terminar().await;
+
+        // Arranca de nuevo (pánico, despliegue o reinicio del servidor): sigue tomada.
+        let b = arrancar_con(vec![vec![EventoSesion::Conectada]], Some(ruta.clone()));
+        sleep(Duration::from_secs(120)).await;
+        let r = b.registro();
+        assert_eq!((r.despertar.len(), r.conectar.len()), (0, 0), "ni despierta ni conecta");
+        assert_eq!(b.estado(), EstadoSesion::TomadaLocal);
+        b.orden(Orden::Reconectar).await;
+        assert_eq!(b.registro().conectar.len(), 1, "reconectar la retoma");
+        assert_eq!(leer_pausa(&ruta), None, "y borra la pausa");
+        sleep(Duration::from_millis(10)).await;
+        assert_eq!(b.estado(), EstadoSesion::Conectada);
+        b.terminar().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn un_reinicio_no_saca_del_reposo() {
+        let dir = dir_de_prueba("reinicio-reposo");
+        let ruta = dir.join("pausa");
+        let b = arrancar_con(vec![vec![EventoSesion::Conectada]], Some(ruta.clone()));
+        sleep(Duration::from_secs(1)).await;
+        b.orden(Orden::Reposo).await;
+        assert_eq!(leer_pausa(&ruta).as_deref(), Some("reposo"));
+        b.terminar().await;
+
+        let b = arrancar_con(vec![vec![EventoSesion::Conectada]], Some(ruta.clone()));
+        sleep(Duration::from_secs(120)).await;
+        assert_eq!(b.registro().conectar.len(), 0);
+        assert_eq!(b.estado(), EstadoSesion::Reposo);
+        b.orden(Orden::Reconectar).await;
+        assert_eq!(b.registro().conectar.len(), 0, "en reposo, reconectar no hace nada");
+        assert_eq!(leer_pausa(&ruta).as_deref(), Some("reposo"));
+        b.orden(Orden::Encender).await;
+        let r = b.registro();
+        assert_eq!((r.despertar.len(), r.conectar.len()), (1, 1), "encender despierta y conecta");
+        assert_eq!(leer_pausa(&ruta), None);
+        b.terminar().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn la_pausa_sigue_al_estado() {
+        let dir = dir_de_prueba("sigue");
+        let ruta = dir.join("pausa");
+        let mut guion = vec![vec![EventoSesion::Conectada]];
+        guion.push(vec![EventoSesion::Conectada]);
+        let b = arrancar_con(guion, Some(ruta.clone()));
+        sleep(Duration::from_secs(1)).await;
+        assert_eq!(leer_pausa(&ruta), None, "conectada: sin pausa");
+        b.emisor().send(EventoSesion::Cerrada { motivo: MotivoCierre::TomadaLocal }).await.unwrap();
+        sleep(Duration::from_millis(1)).await;
+        assert_eq!(leer_pausa(&ruta).as_deref(), Some("tomada"));
+        b.orden(Orden::Reposo).await;
+        assert_eq!(leer_pausa(&ruta).as_deref(), Some("reposo"), "de tomada a reposo");
+        b.orden(Orden::Encender).await;
+        assert_eq!(leer_pausa(&ruta), None);
+        assert!(std::fs::read_dir(&dir).unwrap().next().is_none(), "no quedan temporales");
+        b.terminar().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sin_pausa_guardada_arranca_y_conecta() {
+        let dir = dir_de_prueba("sin");
+        let b = arrancar_con(vec![vec![EventoSesion::Conectada]], Some(dir.join("pausa")));
+        sleep(Duration::from_millis(10)).await;
+        let r = b.registro();
+        assert_eq!((r.despertar.len(), r.conectar.len()), (1, 1));
+        assert_eq!(b.estado(), EstadoSesion::Conectada);
+        b.terminar().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn una_pausa_corrupta_se_ignora_y_se_borra() {
+        let dir = dir_de_prueba("corrupta");
+        let ruta = dir.join("pausa");
+        std::fs::write(&ruta, "cualquier cosa\n").unwrap();
+        let b = arrancar_con(vec![vec![EventoSesion::Conectada]], Some(ruta.clone()));
+        sleep(Duration::from_millis(10)).await;
+        assert_eq!(b.registro().conectar.len(), 1, "como sin pausa");
+        assert!(!ruta.exists(), "la borra");
+        b.terminar().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn una_pausa_que_no_se_puede_leer_se_ignora() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = dir_de_prueba("ilegible");
+        let ruta = dir.join("pausa");
+        std::fs::write(&ruta, "tomada\n").unwrap();
+        std::fs::set_permissions(&ruta, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&ruta).is_ok() {
+            return; // como root se lee igual: no hay nada que probar
+        }
+        let b = arrancar_con(vec![vec![EventoSesion::Conectada]], Some(ruta.clone()));
+        sleep(Duration::from_millis(10)).await;
+        assert_eq!(b.registro().conectar.len(), 1, "como sin pausa (se registra la falla)");
+        b.terminar().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn si_no_puede_guardar_la_pausa_igual_queda_en_pausa() {
+        let dir = dir_de_prueba("sin-dir");
+        let ruta = dir.join("no-existe").join("pausa");
+        let b = arrancar_con(vec![vec![EventoSesion::Conectada]], Some(ruta.clone()));
+        sleep(Duration::from_secs(1)).await;
+        b.emisor().send(EventoSesion::Cerrada { motivo: MotivoCierre::TomadaLocal }).await.unwrap();
+        sleep(Duration::from_secs(60)).await;
+        assert_eq!(b.estado(), EstadoSesion::TomadaLocal);
+        assert_eq!(b.registro().conectar.len(), 1);
+        b.terminar().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(start_paused = true)]

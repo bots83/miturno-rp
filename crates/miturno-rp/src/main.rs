@@ -69,6 +69,8 @@ fn correr(rutas: Rutas) -> Result<(), String> {
         let sesion = Arc::new(ConLimite::new(SesionLibchiaki::new()?, MIN_ENTRE_KEYFRAMES_MS));
         let metricas = Arc::new(Metricas::new());
         let (ordenes, enlace) = ciclo::Enlace::nuevo(metricas.clone());
+        // La pausa (consola tomada o reposo) sobrevive a un reinicio: si quedó guardada, se arranca en ella.
+        let enlace = enlace.con_pausa(config.pausa.clone());
         // Todo en este runtime (nada de hilos propios con la sesión): un pánico llega al Drop de la sesión.
         let estado = EstadoServidor::new(Piezas {
             sesion: sesion.clone(),

@@ -37,7 +37,8 @@ pub enum MotivoCierre {
     Red,
     /// La PS5 cerró la sesión ella misma ("Server shutting down"; un corte de red no lo puede mandar).
     /// Medido con la consola real: pasa cuando alguien prende el mando físico y elige perfil. También
-    /// podría ser reposo o apagado desde la consola. El ciclo no la retoma solo: espera `/control/reconectar`.
+    /// lo producen reposo, red desactivada, actualización o apagado desde la consola. El ciclo no la
+    /// retoma solo (ni después de un reinicio: `crate::pausa`): espera `/control/reconectar`.
     TomadaLocal,
     /// Lo que no se arregla solo: versión de Remote Play, Remote Play caído en la consola, PIN pedido,
     /// falla del control o no se pudo crear la sesión en libchiaki. Se reintenta más espaciado.

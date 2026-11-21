@@ -11,8 +11,14 @@ use serde::Deserialize;
 pub const RUTA_CONFIG: &str = "/etc/miturno-video/rp.toml";
 pub const RUTA_CASA: &str = "/etc/miturno-video/casa.env";
 pub const RUTA_PS5: &str = "/etc/miturno-video/ps5.env";
+/// Dónde se guarda la pausa del ciclo (`StateDirectory=miturno-rp` de la unidad).
+pub const RUTA_PAUSA: &str = "/var/lib/miturno-rp/pausa";
 
-/// `rp.toml`. Todos los campos son obligatorios: la instalación (Task 6) los escribe explícitos.
+fn ruta_pausa() -> PathBuf {
+    RUTA_PAUSA.into()
+}
+
+/// `rp.toml`. Todos los campos son obligatorios salvo `pausa`: la instalación (Task 6) los escribe explícitos.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -27,6 +33,10 @@ pub struct Config {
     pub clave_publica: PathBuf,
     /// Token de servidor a servidor de los endpoints de control (Task 5).
     pub token_control: PathBuf,
+    /// Archivo con la pausa del ciclo (consola tomada o reposo), para que sobreviva a un reinicio
+    /// (`crate::pausa`). Por defecto, `RUTA_PAUSA`.
+    #[serde(default = "ruta_pausa")]
+    pub pausa: PathBuf,
 }
 
 /// Todo lo que hace falta para despertar la PS5 y abrir una sesión.
@@ -254,6 +264,7 @@ http = "127.0.0.1:7070"
 cartel = "/var/lib/miturno-video/cartel.ts"
 clave_publica = "/etc/miturno-video/ct-public.pem"
 token_control = "/etc/miturno-video/control.token"
+pausa = "/var/lib/miturno-rp/pausa"
 "#;
 
     fn r(s: &str) -> PathBuf {
@@ -272,8 +283,19 @@ token_control = "/etc/miturno-video/control.token"
                 cartel: r("/var/lib/miturno-video/cartel.ts"),
                 clave_publica: r("/etc/miturno-video/ct-public.pem"),
                 token_control: r("/etc/miturno-video/control.token"),
+                pausa: r("/var/lib/miturno-rp/pausa"),
             }
         );
+    }
+
+    #[test]
+    fn sin_pausa_en_rp_toml_usa_la_ruta_por_defecto() {
+        let sin = TOML.replace("pausa = \"/var/lib/miturno-rp/pausa\"\n", "");
+        assert_ne!(sin, TOML);
+        assert_eq!(parsear_config(&sin, &r("rp.toml")).unwrap().pausa, r(RUTA_PAUSA));
+        assert_eq!(RUTA_PAUSA, "/var/lib/miturno-rp/pausa");
+        let otra = TOML.replace("/var/lib/miturno-rp/pausa", "/srv/pausa");
+        assert_eq!(parsear_config(&otra, &r("rp.toml")).unwrap().pausa, r("/srv/pausa"));
     }
 
     #[test]

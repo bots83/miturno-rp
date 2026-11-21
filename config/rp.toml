@@ -7,3 +7,6 @@ http = "127.0.0.1:7070"
 cartel = "/var/lib/miturno-video/cartel.ts"
 clave_publica = "/etc/miturno-video/ct-public.pem"
 token_control = "/etc/miturno-video/control.token"
+# Pausa del ciclo (consola tomada o reposo), para que un reinicio no retome la consola. Es el
+# StateDirectory de miturno-rp.service.
+pausa = "/var/lib/miturno-rp/pausa"
