@@ -1,0 +1,11 @@
+# Configuración de miturno-rp (sin secretos). Se instala en /etc/miturno-video/rp.toml.
+# El nombre de la conexión de casa va en /etc/miturno-video/casa.env (PS5_HOST) y la registración
+# de la consola en /etc/miturno-video/ps5.env (PS5_REGIST_KEY, PS5_MORNING, PS5_ACCOUNT_ID; 600 root).
+bitrate_kbps = 8000
+salida_udp = "127.0.0.1:9000"
+http = "127.0.0.1:7070"
+cartel = "/var/lib/miturno-video/cartel.ts"
+options_intervalo_ms = 30000
+options_max_ms = 2000
+clave_publica = "/etc/miturno-video/ct-public.pem"
+token_control = "/etc/miturno-video/control.token"

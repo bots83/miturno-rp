@@ -7,3 +7,13 @@ license.workspace = true
 
 [dependencies]
 rp-core = { path = "../rp-core" }
+# Bindings de libchiaki (chiaki-ng v1.10.1), fijados por commit. Sin la feature "opus": el audio pasa sin decodificar.
+libchiaki = { git = "https://github.com/nanpuyue/libchiaki", rev = "afe087e", default-features = false }
+mpeg2ts = "=0.6.1"
+tokio = { version = "=1.54.1", features = ["rt", "macros", "time", "sync", "signal"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+toml = { version = "=1.2.1", default-features = false, features = ["std", "parse", "serde"] }
+base64 = "=0.22.1"
+
+[dev-dependencies]
+tokio = { version = "=1.54.1", features = ["rt", "macros", "time", "sync", "signal", "test-util"] }
