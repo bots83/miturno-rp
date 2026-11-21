@@ -20,7 +20,9 @@ use tokio::sync::{mpsc, oneshot};
 use super::{ErrorSesion, EventoSesion, MotivoCierre, SesionPs5};
 use crate::config::Perfil;
 
-/// ~4 s de video a 60 fps: absorbe frenadas cortas del ciclo sin perder cuadros.
+/// Unos 1,6 s de eventos (60 cuadros y ~100 paquetes de audio por segundo): absorbe frenadas cortas
+/// del ciclo sin perder cuadros. Los que no entran se descartan (ver el callback de video) y no se
+/// cuentan en `perdidos`.
 const CAPACIDAD: usize = 256;
 
 enum Cmd {
