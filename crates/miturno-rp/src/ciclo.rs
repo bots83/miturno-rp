@@ -1,6 +1,7 @@
-//! El ciclo de la sesión: despertar → conectar → transmitir y, si se cae, reintentar con espera
-//! creciente (1, 2, 4… hasta 60 s). Si la PS5 dice "Remote is already in use", espera 30 s y reintenta
-//! sin despertarla de nuevo. Mientras tanto la salida nunca se corta: muestra el cartel.
+//! El ciclo de la sesión: despertar → conectar → transmitir y, si se cae, reintentar según el motivo
+//! (`rp_core::reintento`): por red, 1, 2, 4 y después cada 5 s; si la PS5 dice "Remote is already in
+//! use", cada 3 s y sin despertarla de nuevo; por otro motivo (versión, PIN, el hilo de libchiaki
+//! muerto…), creciente hasta 30 s. Mientras tanto la salida nunca se corta: muestra el cartel.
 //! Ante SIGTERM cierra la sesión con `session.stop()` (vía `detener()`) y termina en menos de 5 s.
 //! Recibe órdenes del servidor (`/control/*`): reconectar, reposo (la PS5 se apaga y el ciclo queda en
 //! pausa, si no la volvería a despertar) y encender (sale de la pausa). Escribe las métricas de la salud.
@@ -13,13 +14,12 @@ use crate::config::Perfil;
 use crate::metricas::{EstadoSesion, Metricas};
 use crate::mux::Destino;
 use crate::salida::Salida;
-use crate::sesion::{EventoSesion, MotivoCierre, SesionPs5};
+use crate::sesion::{EventoSesion, SesionPs5};
+use rp_core::reintento::ESPERA_INICIAL;
+use rp_core::{Causa, Reintentos};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-pub const ESPERA_INICIAL: Duration = Duration::from_secs(1);
-pub const ESPERA_MAXIMA: Duration = Duration::from_secs(60);
-pub const ESPERA_EN_USO: Duration = Duration::from_secs(30);
 /// Si después de `conectar` no llega ni `Conectada` ni `Cerrada`, se da el intento por fallido.
 pub const PLAZO_CONEXION: Duration = Duration::from_secs(20);
 /// Conectada pero sin video por este tiempo: la sesión se da por caída (por ejemplo, si se perdió el aviso).
@@ -117,21 +117,18 @@ where
     };
     tokio::pin!(senales);
     let mut estado = Estado::Esperando { hasta: t0, despertar: true };
-    let mut espera = ESPERA_INICIAL;
+    let mut reintentos = Reintentos::new();
     let mut intento = 0u64;
 
-    // Pasa a esperar el próximo intento; con EnUso, 30 s fijos y sin despertar.
-    let reintentar = |espera: &mut Duration, en_uso: bool| -> Estado {
-        let ahora = Instant::now();
-        if en_uso {
-            crate::info!("ciclo: la PS5 tiene otra sesión abierta; reintento en {} s sin despertarla", ESPERA_EN_USO.as_secs());
-            Estado::Esperando { hasta: ahora + ESPERA_EN_USO, despertar: false }
+    // Pasa a esperar el próximo intento; la espera (y si se despierta) depende del motivo.
+    let reintentar = |reintentos: &mut Reintentos, causa: Causa| -> Estado {
+        let e = reintentos.proxima(causa);
+        if causa == Causa::EnUso {
+            crate::info!("ciclo: la PS5 tiene otra sesión abierta (EnUso); reintento en {} s sin despertarla", e.dura.as_secs());
         } else {
-            let e = *espera;
-            *espera = (e * 2).min(ESPERA_MAXIMA);
-            crate::info!("ciclo: reintento en {} s", e.as_secs());
-            Estado::Esperando { hasta: ahora + e, despertar: true }
+            crate::info!("ciclo: reintento en {} s (motivo: {causa:?})", e.dura.as_secs());
         }
+        Estado::Esperando { hasta: Instant::now() + e.dura, despertar: e.despertar }
     };
 
     loop {
@@ -194,9 +191,9 @@ where
                             crate::info!("ciclo: la sesión terminó ({motivo:?}) después de {} s", duro.as_secs());
                             salida.sesion_caida(t0.elapsed());
                             if duro >= SESION_ESTABLE {
-                                espera = ESPERA_INICIAL;
+                                reintentos.reiniciar();
                             }
-                            estado = reintentar(&mut espera, motivo == MotivoCierre::EnUso);
+                            estado = reintentar(&mut reintentos, motivo.causa());
                         }
                     }
                 }
@@ -225,7 +222,7 @@ where
                     }
                     (Orden::Encender, Estado::Reposo { .. } | Estado::Esperando { .. }) => {
                         crate::info!("ciclo: encender pedido; despierto la PS5 y conecto");
-                        espera = ESPERA_INICIAL;
+                        reintentos.reiniciar();
                         estado = Estado::Esperando { hasta: ahora, despertar: true };
                     }
                     (Orden::Encender, _) => crate::info!("ciclo: encender pedido, pero ya hay sesión"),
@@ -234,7 +231,7 @@ where
                     }
                     (Orden::Reconectar, Estado::Esperando { despertar, .. }) => {
                         crate::info!("ciclo: reconectar pedido; adelanto el intento");
-                        espera = ESPERA_INICIAL;
+                        reintentos.reiniciar();
                         estado = Estado::Esperando { hasta: ahora, despertar: *despertar };
                     }
                     (Orden::Reconectar, Estado::Conectando { .. } | Estado::Conectada { .. }) => {
@@ -242,7 +239,7 @@ where
                         // Igual que al darla por caída: se cierra en segundo plano para no frenar el cartel.
                         tokio::spawn(sesion.detener());
                         salida.sesion_caida(t0.elapsed());
-                        espera = ESPERA_INICIAL;
+                        reintentos.reiniciar();
                         estado = Estado::Esperando { hasta: ahora + ESPERA_INICIAL, despertar: true };
                     }
                 }
@@ -262,8 +259,9 @@ where
                                 Estado::Conectando { desde: Instant::now() }
                             }
                             Err(e) => {
+                                // No hay con quién hablar (murió el hilo de libchiaki): espera larga.
                                 crate::falla!("ciclo: no pude iniciar la sesión: {e}");
-                                reintentar(&mut espera, false)
+                                reintentar(&mut reintentos, Causa::Otra)
                             }
                         };
                     }
@@ -273,13 +271,13 @@ where
                         // Igual que con Cerrada: si la sesión venía estable (un corte de Wi-Fi), se reintenta enseguida.
                         if let Estado::Conectada { desde, .. } = estado {
                             if Instant::now() - desde >= SESION_ESTABLE {
-                                espera = ESPERA_INICIAL;
+                                reintentos.reiniciar();
                             }
                         }
                         // Se cierra en segundo plano para no frenar el cartel.
                         tokio::spawn(sesion.detener());
                         salida.sesion_caida(t0.elapsed());
-                        estado = reintentar(&mut espera, false);
+                        estado = reintentar(&mut reintentos, Causa::Red);
                     }
                     Estado::Reposo { .. } => {
                         crate::info!("ciclo: cierro la sesión que quedó del reposo");
@@ -306,6 +304,7 @@ where
 mod tests {
     use super::*;
     use crate::mux::tests::leer_pes;
+    use crate::sesion::MotivoCierre;
     use crate::mux::ID_VIDEO;
     use crate::salida::tests::cartel_de_prueba;
     use crate::sesion::falsa::SesionFalsa;
@@ -442,14 +441,14 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn caida_por_red_reintenta_con_espera_creciente_hasta_60_s() {
+    async fn caida_por_red_reintenta_1_2_4_y_despues_cada_5_s() {
         let cerrada = vec![EventoSesion::Cerrada { motivo: MotivoCierre::Red }];
         let b = arrancar(vec![cerrada; 9]);
-        sleep(Duration::from_secs(190)).await;
+        sleep(Duration::from_secs(35)).await;
         let r = b.registro();
         let t = b.segundos(&r.conectar);
         assert!(t.len() >= 9, "{t:?}");
-        assert_eq!(diferencias(&t[..9]), vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0]);
+        assert_eq!(diferencias(&t[..9]), vec![1.0, 2.0, 4.0, 5.0, 5.0, 5.0, 5.0, 5.0], "tope de 5 s");
         assert_eq!(t[0], 0.0, "el primer intento es inmediato");
         // Con Red se despierta antes de cada intento.
         assert_eq!(b.segundos(&r.despertar)[..9], t[..9]);
@@ -457,14 +456,72 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn en_uso_espera_30_s_y_no_vuelve_a_despertar() {
+    async fn en_uso_reintenta_cada_3_s_sin_despertar() {
         let en_uso = vec![EventoSesion::Cerrada { motivo: MotivoCierre::EnUso }];
         let b = arrancar(vec![en_uso; 3]);
+        sleep(Duration::from_secs(10)).await;
+        let r = b.registro();
+        let t = b.segundos(&r.conectar);
+        assert_eq!(t, vec![0.0, 3.0, 6.0, 9.0]);
+        assert_eq!(r.despertar.len(), 1, "solo el despertar del primer intento");
+        b.terminar().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn corte_de_wifi_con_en_uso_vuelve_en_pocos_segundos() {
+        // Lo medido con la PS5 real: la sesión se cae y la PS5 todavía tiene la vieja un rato.
+        let en_uso = || vec![EventoSesion::Cerrada { motivo: MotivoCierre::EnUso }];
+        let b = arrancar(vec![vec![EventoSesion::Conectada], en_uso(), en_uso(), vec![EventoSesion::Conectada]]);
+        sleep(Duration::from_secs(2)).await;
+        b.emisor().send(EventoSesion::Cerrada { motivo: MotivoCierre::Red }).await.unwrap();
+        sleep(Duration::from_secs(10)).await;
+        let r = b.registro();
+        assert_eq!(b.segundos(&r.conectar), vec![0.0, 3.0, 6.0, 9.0], "Red: 1 s; después EnUso: 3 s y 3 s");
+        assert_eq!(b.segundos(&r.despertar), vec![0.0, 3.0], "con EnUso no se despierta");
+        assert_eq!(b.estado(), EstadoSesion::Conectada);
+        b.terminar().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn en_uso_no_hace_crecer_la_espera_de_red() {
+        let red = || vec![EventoSesion::Cerrada { motivo: MotivoCierre::Red }];
+        let en_uso = || vec![EventoSesion::Cerrada { motivo: MotivoCierre::EnUso }];
+        let b = arrancar(vec![red(), en_uso(), en_uso(), en_uso(), red(), red()]);
+        sleep(Duration::from_secs(20)).await;
+        let t = b.segundos(&b.registro().conectar);
+        assert_eq!(diferencias(&t[..7]), vec![1.0, 3.0, 3.0, 3.0, 2.0, 4.0], "{t:?}");
+        b.terminar().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn otro_motivo_espera_hasta_30_s_para_no_martillar() {
+        let otro = vec![EventoSesion::Cerrada { motivo: MotivoCierre::Otro }];
+        let b = arrancar(vec![otro; 8]);
         sleep(Duration::from_secs(95)).await;
         let r = b.registro();
         let t = b.segundos(&r.conectar);
-        assert_eq!(t, vec![0.0, 30.0, 60.0, 90.0]);
-        assert_eq!(r.despertar.len(), 1, "solo el despertar del primer intento");
+        assert_eq!(diferencias(&t[..8]), vec![1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 30.0], "{t:?}");
+        assert_eq!(b.segundos(&r.despertar)[..8], t[..8], "se despierta antes de cada intento");
+        b.terminar().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hilo_terminado_espera_hasta_30_s() {
+        let b = arrancar(vec![]);
+        b.sesion.interna().romper();
+        sleep(Duration::from_secs(95)).await;
+        let t = b.segundos(&b.registro().conectar);
+        assert_eq!(t, vec![0.0, 1.0, 3.0, 7.0, 15.0, 31.0, 61.0, 91.0]);
+        b.terminar().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sin_respuesta_repetida_tambien_tiene_tope_de_5_s() {
+        let b = arrancar(vec![]);
+        sleep(Duration::from_secs(120)).await;
+        let t = b.segundos(&b.registro().conectar);
+        // Cada intento espera 20 s la respuesta; entre uno y otro, 1, 2, 4, 5 y 5 s.
+        assert_eq!(t, vec![0.0, 21.0, 43.0, 67.0, 92.0, 117.0]);
         b.terminar().await;
     }
 
@@ -498,17 +555,29 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn una_sesion_estable_vuelve_la_espera_a_1_s() {
         let red = || vec![EventoSesion::Cerrada { motivo: MotivoCierre::Red }];
-        let b = arrancar(vec![red(), red(), vec![EventoSesion::Conectada], red()]);
-        sleep(Duration::from_secs(3)).await; // intentos en 0, 1 y 3 s; el de 3 s conecta
+        let b = arrancar(vec![red(), red(), red(), red(), vec![EventoSesion::Conectada], red()]);
+        sleep(Duration::from_secs(12)).await; // intentos en 0, 1, 3, 7 y 12 s (ya en el tope); el de 12 s conecta
         let tx = b.emisor();
         for _ in 0..8 {
             sleep(Duration::from_secs(5)).await;
             tx.send(video(vec![0, 0, 0, 1, 0x41, 0x50, 0])).await.unwrap();
         }
-        tx.send(EventoSesion::Cerrada { motivo: MotivoCierre::Red }).await.unwrap(); // a los 43 s
+        tx.send(EventoSesion::Cerrada { motivo: MotivoCierre::Red }).await.unwrap(); // a los 52 s
         sleep(Duration::from_secs(5)).await;
         let t = b.segundos(&b.registro().conectar);
-        assert_eq!(t, vec![0.0, 1.0, 3.0, 44.0, 46.0], "después de 40 s conectada, la espera vuelve a 1 s");
+        assert_eq!(t, vec![0.0, 1.0, 3.0, 7.0, 12.0, 53.0, 55.0], "después de 40 s conectada, la espera vuelve a 1 s");
+        b.terminar().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn una_sesion_corta_no_vuelve_la_espera_a_1_s() {
+        let red = || vec![EventoSesion::Cerrada { motivo: MotivoCierre::Red }];
+        let b = arrancar(vec![red(), red(), red(), red(), vec![EventoSesion::Conectada], red()]);
+        sleep(Duration::from_secs(14)).await; // conectada a los 12 s
+        b.emisor().send(EventoSesion::Cerrada { motivo: MotivoCierre::Red }).await.unwrap(); // a los 14 s
+        sleep(Duration::from_secs(6)).await;
+        let t = b.segundos(&b.registro().conectar);
+        assert_eq!(t, vec![0.0, 1.0, 3.0, 7.0, 12.0, 19.0], "2 s conectada no cuenta como estable: sigue en 5 s");
         b.terminar().await;
     }
 

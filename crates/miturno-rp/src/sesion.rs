@@ -35,7 +35,20 @@ pub enum MotivoCierre {
     EnUso,
     /// No se pudo conectar o se cortó la conexión.
     Red,
+    /// Lo que no se arregla solo: versión de Remote Play, Remote Play caído en la consola, PIN pedido,
+    /// falla del control o no se pudo crear la sesión en libchiaki. Se reintenta más espaciado.
     Otro,
+}
+
+impl MotivoCierre {
+    /// Para la espera hasta el próximo intento (`rp_core::reintento`).
+    pub fn causa(self) -> rp_core::Causa {
+        match self {
+            MotivoCierre::EnUso => rp_core::Causa::EnUso,
+            MotivoCierre::Red => rp_core::Causa::Red,
+            MotivoCierre::Otro => rp_core::Causa::Otra,
+        }
+    }
 }
 
 /// Mínimo entre pedidos de keyframe (spec §5.2): pedirlos seguido congela la imagen.

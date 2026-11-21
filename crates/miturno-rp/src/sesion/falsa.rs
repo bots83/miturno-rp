@@ -3,6 +3,7 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rp_core::EstadoMando;
@@ -28,6 +29,8 @@ pub struct SesionFalsa {
     guion: Mutex<VecDeque<Vec<EventoSesion>>>,
     tx: mpsc::Sender<EventoSesion>,
     rx: Mutex<Option<mpsc::Receiver<EventoSesion>>>,
+    /// Desde `romper()`, `despertar` y `conectar` fallan con `HiloTerminado` (se anotan igual).
+    rota: AtomicBool,
 }
 
 impl SesionFalsa {
@@ -42,6 +45,7 @@ impl SesionFalsa {
             guion: Mutex::new(guion.into()),
             tx,
             rx: Mutex::new(Some(rx)),
+            rota: AtomicBool::new(false),
         }
     }
 
@@ -53,16 +57,30 @@ impl SesionFalsa {
     pub fn emisor(&self) -> mpsc::Sender<EventoSesion> {
         self.tx.clone()
     }
+
+    /// Simula que murió el hilo de libchiaki: desde ahora `despertar` y `conectar` devuelven error.
+    pub fn romper(&self) {
+        self.rota.store(true, Ordering::SeqCst);
+    }
+
+    fn resultado(&self) -> Result<(), ErrorSesion> {
+        if self.rota.load(Ordering::SeqCst) {
+            Err(ErrorSesion::HiloTerminado)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl SesionPs5 for SesionFalsa {
     fn despertar(&self, _perfil: &Perfil) -> Result<(), ErrorSesion> {
         self.registro.lock().unwrap().despertar.push(Instant::now());
-        Ok(())
+        self.resultado()
     }
 
     fn conectar(&self, _perfil: &Perfil) -> Result<(), ErrorSesion> {
         self.registro.lock().unwrap().conectar.push(Instant::now());
+        self.resultado()?;
         if let Some(eventos) = self.guion.lock().unwrap().pop_front() {
             for e in eventos {
                 self.tx.try_send(e).expect("canal de la sesión falsa lleno");
