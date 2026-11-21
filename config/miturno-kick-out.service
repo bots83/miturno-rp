@@ -8,6 +8,9 @@
 # ps5 nunca se queda sin video.
 #
 # Destino:
+# - lo arma kick_destino (/usr/local/lib/miturno/kick-destino.sh, tests en scripts/test-kick-destino.sh):
+#   Kick usa Amazon IVS y la publicación va a rtmps://<ingesta>:443/app/<clave>; si a la URL cargada le
+#   falta la ruta, agrega /app (y :443 en rtmps sin puerto);
 # - por defecto, KICK_RTMP_URL + KICK_STREAM_KEY de /etc/miturno-video/kick.env (600 root; los carga
 #   el usuario con sudo miturno-configurar-kick). systemd lee el archivo como root: la clave no está
 #   en esta unidad ni en `systemctl show`;
@@ -52,15 +55,9 @@ SyslogIdentifier=miturno-kick-out
 # $$ es un $ para bash (systemd no reemplaza nada: la clave nunca pasa por la línea de esta unidad).
 ExecStart=/bin/bash -c '\
   set -u; \
-  if [ -n "$${KICK_DESTINO:-}" ]; then \
-    destino=$$KICK_DESTINO; \
-  elif [ -n "$${KICK_RTMP_URL:-}" ] && [ -n "$${KICK_STREAM_KEY:-}" ]; then \
-    case $$KICK_RTMP_URL in \
-      */) destino=$$KICK_RTMP_URL$$KICK_STREAM_KEY ;; \
-      *) destino=$$KICK_RTMP_URL/$$KICK_STREAM_KEY ;; \
-    esac; \
-  else \
-    echo "kick-out: falta /etc/miturno-video/kick.env con KICK_RTMP_URL y KICK_STREAM_KEY (cargalos con: sudo miturno-configurar-kick)" >&2; \
+  . /usr/local/lib/miturno/kick-destino.sh; \
+  if ! destino=$$(kick_destino); then \
+    echo "kick-out: falta /etc/miturno-video/kick.env con KICK_RTMP_URL (rtmps://…) y KICK_STREAM_KEY (cargalos con: sudo miturno-configurar-kick)" >&2; \
     exit 78; \
   fi; \
   unset KICK_STREAM_KEY KICK_RTMP_URL KICK_DESTINO; \
