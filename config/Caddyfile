@@ -7,8 +7,10 @@
 # - /ctl (WebSocket de los mandos) y /control/* (salud y acciones, con el token de la api) → miturno-rp;
 # - todo lo demás → 404. /interno/* de miturno-rp nunca pasa por acá.
 {
-	# La API de administración de Caddy queda solo local (es el valor por defecto; explícito).
-	admin localhost:2019
+	# La API de administración de Caddy va por un socket unix que solo pueden abrir caddy y root
+	# (/run/caddy es 0700, lo crea el drop-in caddy-miturno.conf). Por TCP, cualquier usuario local
+	# (rp, mediamtx) podría reconfigurar el 443 público. `systemctl reload caddy` usa este socket.
+	admin unix//run/caddy/admin.sock
 	servers {
 		# Sin HTTP/3: el UDP 443 no está abierto en ufw.
 		protocols h1 h2

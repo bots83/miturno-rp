@@ -270,7 +270,7 @@ async fn bucle<S: SesionPs5>(
                     MsgCliente::Latido {} => {}
                     MsgCliente::PedirKeyframe {} => {
                         let enviado = e.sesion.pedir_keyframe();
-                        crate::depurar!("ctl: conexión {id}: keyframe {}", if enviado { "pedido" } else { "limitado" });
+                        crate::depurar!("ctl: conexión {id}: keyframe {}", if enviado { "pedido" } else { "diferido" });
                     }
                 }
             }

@@ -16,9 +16,13 @@
 #     [Service]
 #     Environment=KICK_DESTINO=rtmp://127.0.0.1:1935/kick-humo
 #
-# La clave tiene que ir en los argumentos de ffmpeg (RTMP no tiene otra forma); por eso miturno-rp y
-# MediaMTX corren con ProtectProc=invisible (no ven los procesos de otros usuarios) y los mensajes
-# de ffmpeg pasan por un filtro que tapa cualquier URL rtmp(s) y cualquier clave sk_… antes de llegar
+# La clave tiene que ir en los argumentos de ffmpeg (RTMP no tiene otra forma), y /proc no está montado
+# con hidepid: cualquier proceso de otro usuario que NO tenga ProtectProc=invisible puede leer la línea
+# de comandos de ffmpeg. ProtectProc protege a quien lo lleva puesto (no ve a los demás), no a ffmpeg.
+# Por eso lo llevan los servicios expuestos a la red que corren con otro usuario: miturno-rp y
+# MediaMTX (en sus unidades), Caddy (drop-in caddy-miturno.conf) y coturn (drop-in de la Task 7).
+# Root y el usuario administrador miturno (que tiene sudo) la ven igual. Además, los mensajes de
+# ffmpeg pasan por un filtro que tapa cualquier URL rtmp(s) y cualquier clave sk_… antes de llegar
 # al journal.
 #
 # Parámetros (los medidos en el banco de pruebas): 1280×720 a 60 fps constantes (la PS5 entrega
@@ -79,6 +83,7 @@ RestartMaxDelaySec=30
 RestartPreventExitStatus=78
 
 # Sin privilegios (DynamicUser ya implica ProtectSystem=strict, PrivateTmp y NoNewPrivileges).
+# ProtectProc acá solo evita que ffmpeg vea a los demás procesos; no oculta a ffmpeg.
 CapabilityBoundingSet=
 ProtectHome=true
 PrivateDevices=true

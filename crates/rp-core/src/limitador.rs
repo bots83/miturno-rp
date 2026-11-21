@@ -22,6 +22,12 @@ impl LimitadorKeyframe {
         }
         ok
     }
+
+    /// Desde qué momento (ms) un pedido pasaría: lo usa quien difiere un pedido rechazado al final
+    /// de la ventana, en vez de perderlo.
+    pub fn libre_desde(&self) -> u64 {
+        self.ultimo_permitido.map_or(0, |t| t.saturating_add(self.min_ms))
+    }
 }
 
 #[cfg(test)]
@@ -39,6 +45,16 @@ mod tests {
     #[test]
     fn el_primero_pasa_aunque_el_reloj_sea_chico() {
         assert!(LimitadorKeyframe::new(3_000).permitir(5));
+    }
+
+    #[test]
+    fn dice_desde_cuando_hay_lugar() {
+        let mut l = LimitadorKeyframe::new(3_000);
+        assert_eq!(l.libre_desde(), 0, "sin pedidos, hay lugar ya");
+        assert!(l.permitir(1_000));
+        assert_eq!(l.libre_desde(), 4_000);
+        assert!(!l.permitir(2_000));
+        assert_eq!(l.libre_desde(), 4_000, "un rechazo no la mueve");
     }
 
     #[test]

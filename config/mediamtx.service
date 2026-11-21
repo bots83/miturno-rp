@@ -16,7 +16,7 @@ RestartSec=2
 LimitNOFILE=65536
 
 # Sin privilegios: no escribe en disco y no ve los procesos de otros usuarios (ProtectProc), así un
-# MediaMTX comprometido no puede leer la línea de comandos de kick-out.
+# MediaMTX comprometido no puede leer la línea de comandos de kick-out (la clave de Kick).
 NoNewPrivileges=true
 CapabilityBoundingSet=
 ProtectSystem=strict

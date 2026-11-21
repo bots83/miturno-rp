@@ -270,10 +270,11 @@ async fn auth_mediamtx<S: SesionPs5>(State(e): State<Compartido<S>>, cuerpo: Byt
     }
 }
 
-/// Pedido de keyframe del hook de MediaMTX o de kick-out. Pasa por el limitador único.
+/// Pedido de keyframe del hook de MediaMTX o de kick-out. Pasa por el limitador único: `enviado: false`
+/// quiere decir que cayó dentro de la ventana de 3 s y sale diferido al final de la ventana.
 async fn keyframe<S: SesionPs5>(State(e): State<Compartido<S>>) -> Json<serde_json::Value> {
     let enviado = e.sesion.pedir_keyframe();
-    crate::depurar!("interno/keyframe: {}", if enviado { "pedido" } else { "limitado" });
+    crate::depurar!("interno/keyframe: {}", if enviado { "pedido" } else { "diferido" });
     Json(json!({ "enviado": enviado }))
 }
 

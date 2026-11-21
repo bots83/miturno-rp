@@ -450,10 +450,15 @@ async fn ctl_keyframe_pasa_por_el_limitador_unico() {
     // El mismo limitador que /interno/keyframe.
     let (st, cuerpo) = b.pedir("POST", "/interno/keyframe", local(), None, "").await;
     assert_eq!((st, cuerpo.as_str()), (StatusCode::OK, r#"{"enviado":false}"#));
+    // Los dos rechazados (el segundo de /ctl y el de /interno) no se pierden: salen juntos, en un
+    // solo pedido diferido, al final de la ventana de 3 s.
     sleep(Duration::from_secs(3)).await;
+    assert_eq!(b.sesion.interna().registro().keyframes, 2);
     enviar(&mut ws, json!({"t":"keyframe"})).await;
     sleep(Duration::from_millis(5)).await;
-    assert_eq!(b.sesion.interna().registro().keyframes, 2);
+    assert_eq!(b.sesion.interna().registro().keyframes, 2, "el diferido corrió la ventana");
+    sleep(Duration::from_secs(3)).await;
+    assert_eq!(b.sesion.interna().registro().keyframes, 3);
 }
 
 #[tokio::test(start_paused = true)]
