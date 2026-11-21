@@ -18,8 +18,10 @@ pub const VENTANA: Duration = Duration::from_secs(10);
 pub enum EstadoSesion {
     Conectada,
     Conectando,
-    /// Sin sesión: esperando el próximo intento, o la PS5 en reposo.
+    /// Sin sesión: esperando el próximo intento.
     Caida,
+    /// En pausa por `/control/reposo` (la PS5 en reposo), hasta `/control/encender`.
+    Reposo,
 }
 
 /// Lo que se publica en `VideoSalud.sesion` (los nombres los fija el tipo de la api).
@@ -219,6 +221,18 @@ mod tests {
         let f = m.foto(t0 + Duration::from_secs(1));
         assert_eq!((f.estado, f.fps, f.kbps, f.perdidos), (EstadoSesion::Caida, 0.0, 0, 0));
         assert_eq!(f.ultima_reconexion.as_deref(), Some("2027-01-15T08:00:00Z"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn en_reposo_no_hay_video_y_se_informa_reposo() {
+        let m = Metricas::new();
+        let t0 = Instant::now();
+        m.conectada(t0, unix(0));
+        m.cuadro(t0, 1_000, 1);
+        m.estado(EstadoSesion::Reposo);
+        let f = m.foto(t0 + Duration::from_secs(1));
+        assert_eq!((f.estado, f.fps, f.kbps, f.perdidos), (EstadoSesion::Reposo, 0.0, 0, 0));
+        assert_eq!(serde_json::to_value(EstadoSesion::Reposo).unwrap(), serde_json::json!("reposo"));
     }
 
     #[test]

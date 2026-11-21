@@ -121,6 +121,11 @@ pub struct EstadoServidor<S: SesionPs5> {
     ranura: Mutex<Option<ctl::Ocupante>>,
     proximo_id: AtomicU64,
     cpu: Mutex<f64>,
+    /// Toques descartados por el filtro, sumados de todas las conexiones terminadas.
+    descartados: AtomicU64,
+    /// Solo tests: la conexión entra en pánico después de aplicar un `estado`.
+    #[cfg(test)]
+    panico_en_estado: std::sync::atomic::AtomicBool,
 }
 
 impl<S: SesionPs5> EstadoServidor<S> {
@@ -138,7 +143,15 @@ impl<S: SesionPs5> EstadoServidor<S> {
             ranura: Mutex::new(None),
             proximo_id: AtomicU64::new(1),
             cpu: Mutex::new(0.0),
+            descartados: AtomicU64::new(0),
+            #[cfg(test)]
+            panico_en_estado: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Toques descartados por el filtro de rol en las conexiones de `/ctl` ya terminadas.
+    pub fn descartados(&self) -> u64 {
+        self.descartados.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 

@@ -11,6 +11,8 @@
 //!
 //! Solo el controlador actual llega a `poner_mando`, y siempre con la ranura tomada: así el "todo
 //! suelto" de una conexión vieja nunca pisa a la nueva.
+//! La ranura la libera un guardián (`Dueno`) al soltarse: también si la tarea entra en pánico o se
+//! cancela. Al terminar se registran el rol y los toques que descartó el filtro (nunca el token).
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -30,6 +32,9 @@ use crate::sesion::SesionPs5;
 pub const PLAZO_AUTH: Duration = Duration::from_secs(2);
 /// Silencio (sin mensajes ni latidos) tras el que se suelta todo.
 pub const SILENCIO_MS: u64 = 500;
+/// Tope de una conexión aunque la credencial venza más tarde (las de F1 duran 1 h). También evita
+/// desbordar el reloj con un `exp` enorme.
+pub const TOPE_CONEXION: Duration = Duration::from_secs(24 * 3600);
 /// Tope de un mensaje (una credencial ocupa menos de 1 KiB).
 const MAX_MENSAJE: usize = 4 * 1024;
 /// Plazo para mandar el último mensaje antes de cerrar (un cliente que no lee no traba la tarea).
@@ -51,9 +56,10 @@ impl<S: SesionPs5> EstadoServidor<S> {
     }
 
     /// Toma el control si no hay nadie o el actual tiene un rol igual o menor. Suelta lo que haya
-    /// dejado el anterior y le avisa. Devuelve el aviso de reemplazo de esta conexión.
-    pub(super) fn tomar(&self, id: u64, rol: Rol) -> Option<oneshot::Receiver<()>> {
-        self.con_ranura(|r| {
+    /// dejado el anterior y le avisa. Devuelve el guardián de la ranura (ya armado, sin ventana en la
+    /// que un pánico la deje tomada) y el aviso de reemplazo de esta conexión.
+    pub(super) fn tomar(self: &Arc<Self>, id: u64, rol: Rol) -> Option<(Dueno<S>, oneshot::Receiver<()>)> {
+        let rx = self.con_ranura(|r| {
             if r.as_ref().is_some_and(|o| rol < o.rol) {
                 return None;
             }
@@ -65,7 +71,8 @@ impl<S: SesionPs5> EstadoServidor<S> {
             *r = Some(Ocupante { id, rol, reemplazo: tx });
             self.sesion.poner_mando(&EstadoMando::suelto());
             Some(rx)
-        })
+        })?;
+        Some((Dueno { e: self.clone(), id }, rx))
     }
 
     /// Pasa el estado a la PS5 solo si esta conexión es la que controla.
@@ -85,6 +92,19 @@ impl<S: SesionPs5> EstadoServidor<S> {
                 *r = None;
             }
         });
+    }
+}
+
+/// Guardián de la ranura: al soltarlo (fin normal, pánico o tarea cancelada) suelta todo y libera la
+/// ranura, si esta conexión todavía la tiene. Así nunca queda la PS5 con botones apretados.
+pub(super) struct Dueno<S: SesionPs5> {
+    e: Arc<EstadoServidor<S>>,
+    id: u64,
+}
+
+impl<S: SesionPs5> Drop for Dueno<S> {
+    fn drop(&mut self) {
+        self.e.soltar(self.id);
     }
 }
 
@@ -128,6 +148,14 @@ async fn despedir(mut socket: WebSocket, m: Option<MsgServidor>) {
     let _ = timeout(PLAZO_ENVIO, socket.send(cierre)).await;
 }
 
+fn nombre_rol(rol: Rol) -> &'static str {
+    match rol {
+        Rol::Operador => "operador",
+        Rol::Jugador => "jugador",
+        Rol::Vista => "vista",
+    }
+}
+
 enum Fin {
     Cerrada,
     Formato,
@@ -151,28 +179,31 @@ async fn conexion<S: SesionPs5>(e: Arc<EstadoServidor<S>>, mut socket: WebSocket
         }
     };
     drop(token);
-    let Some(mut reemplazo) = e.tomar(id, cred.rol) else {
-        crate::info!("ctl: conexión {id} ({:?}) rechazada: hay un controlador de rol mayor", cred.rol);
+    let Some((dueno, mut reemplazo)) = e.tomar(id, cred.rol) else {
+        crate::info!("ctl: conexión {id} (rol={}) rechazada: hay un controlador de rol mayor", nombre_rol(cred.rol));
         return despedir(socket, Some(MsgServidor::error("OCUPADO"))).await;
     };
-    // `exp` es hora de pared: se pasa una sola vez a un plazo del reloj monótono.
-    let vence = Instant::now() + Duration::from_secs(cred.vence_s().saturating_sub(ahora_s));
+    // `exp` es hora de pared: se pasa una sola vez a un plazo del reloj monótono, con tope (un `exp`
+    // enorme desbordaría el `Instant`).
+    let vence = Instant::now() + Duration::from_secs(cred.vence_s().saturating_sub(ahora_s)).min(TOPE_CONEXION);
     if !enviar(&mut socket, &MsgServidor::Ok { rol: cred.rol }).await {
-        e.soltar(id);
         return;
     }
-    crate::info!("ctl: conexión {id} ({:?}) controla la PS5", cred.rol);
+    crate::info!("ctl: conexión {id} (rol={}) controla la PS5", nombre_rol(cred.rol));
 
-    let fin = bucle(&e, id, Filtro::new(cred.rol, e.limites), &mut socket, &mut reemplazo, vence).await;
+    let mut filtro = Filtro::new(cred.rol, e.limites);
+    let fin = bucle(&e, id, &mut filtro, &mut socket, &mut reemplazo, vence).await;
     // Primero se suelta todo (si todavía controla) y recién después se habla con el cliente.
-    e.soltar(id);
+    drop(dueno);
+    let descartados = filtro.descartados();
+    e.descartados.fetch_add(descartados, Ordering::Relaxed);
     let (motivo, ultimo) = match fin {
         Fin::Cerrada => ("cerrada", None),
         Fin::Formato => ("mensaje inválido", Some(MsgServidor::error("FORMATO"))),
         Fin::Vencida => ("credencial vencida", Some(MsgServidor::error("VENCIDA"))),
         Fin::Reemplazada => ("reemplazada", Some(MsgServidor::Reemplazado)),
     };
-    crate::info!("ctl: conexión {id} terminó ({motivo})");
+    crate::info!("ctl: conexión {id} terminada ({motivo}; rol={}, descartados={descartados})", nombre_rol(cred.rol));
     if ultimo.is_some() {
         despedir(socket, ultimo).await;
     }
@@ -181,7 +212,7 @@ async fn conexion<S: SesionPs5>(e: Arc<EstadoServidor<S>>, mut socket: WebSocket
 async fn bucle<S: SesionPs5>(
     e: &EstadoServidor<S>,
     id: u64,
-    mut filtro: Filtro,
+    filtro: &mut Filtro,
     socket: &mut WebSocket,
     reemplazo: &mut oneshot::Receiver<()>,
     vence: Instant,
@@ -231,6 +262,10 @@ async fn bucle<S: SesionPs5>(
                         entrada = EstadoMando { botones, l2, r2, lx, ly, rx, ry };
                         let salida = filtro.aplicar(&entrada, ahora);
                         e.mandar(id, &salida);
+                        #[cfg(test)]
+                        if e.panico_en_estado.load(std::sync::atomic::Ordering::SeqCst) {
+                            panic!("pánico de prueba en la conexión {id}");
+                        }
                     }
                     MsgCliente::Latido {} => {}
                     MsgCliente::PedirKeyframe {} => {

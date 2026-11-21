@@ -80,7 +80,8 @@ impl Estado {
         match self {
             Estado::Conectada { .. } => EstadoSesion::Conectada,
             Estado::Conectando { .. } => EstadoSesion::Conectando,
-            Estado::Esperando { .. } | Estado::Reposo { .. } => EstadoSesion::Caida,
+            Estado::Esperando { .. } => EstadoSesion::Caida,
+            Estado::Reposo { .. } => EstadoSesion::Reposo,
         }
     }
 }
@@ -558,7 +559,7 @@ mod tests {
         b.emisor().send(video(vec![0, 0, 0, 1, 0x65, 0x50, 0])).await.unwrap();
         b.orden(Orden::Reposo).await;
         assert_eq!(b.registro().reposo, 1, "manda la PS5 a reposo");
-        assert_eq!(b.estado(), EstadoSesion::Caida);
+        assert_eq!(b.estado(), EstadoSesion::Reposo, "la salud dice reposo, no caída");
         sleep(Duration::from_millis(50)).await;
         assert!(b.videos().last().unwrap().1.contains(&0xCA), "vuelve el cartel");
         // La PS5 cierra la sesión al irse a dormir: el ciclo no la vuelve a despertar.
@@ -567,6 +568,7 @@ mod tests {
         let r = b.registro();
         assert_eq!((r.despertar.len(), r.conectar.len()), (1, 1), "en pausa: ni despierta ni conecta");
         assert_eq!(r.detener, 1, "a los 10 s cierra con stop() por si la sesión quedó abierta");
+        assert_eq!(b.estado(), EstadoSesion::Reposo, "sigue en reposo hasta encender");
         b.orden(Orden::Encender).await;
         let r = b.registro();
         assert_eq!((r.despertar.len(), r.conectar.len()), (2, 2), "encender: despierta y conecta ya");
@@ -582,14 +584,17 @@ mod tests {
         sleep(Duration::from_millis(500)).await; // el primer intento falló; el próximo sería a 1 s
         b.orden(Orden::Reposo).await;
         assert_eq!(b.registro().reposo, 1, "se pide igual (sin sesión, la falsa lo anota)");
+        assert_eq!(b.estado(), EstadoSesion::Reposo);
         sleep(Duration::from_secs(100)).await;
         assert_eq!(b.registro().conectar.len(), 1);
         // Reconectar no saca de la pausa.
         b.orden(Orden::Reconectar).await;
         sleep(Duration::from_secs(5)).await;
         assert_eq!(b.registro().conectar.len(), 1);
+        assert_eq!(b.estado(), EstadoSesion::Reposo, "reconectar no saca del reposo");
         b.orden(Orden::Encender).await;
         assert_eq!(b.registro().conectar.len(), 2);
+        assert_ne!(b.estado(), EstadoSesion::Reposo, "encender sale del reposo");
         b.terminar().await;
     }
 

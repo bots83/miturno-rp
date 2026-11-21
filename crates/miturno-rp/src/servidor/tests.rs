@@ -15,7 +15,7 @@ use ed25519_dalek::pkcs8::{EncodePrivateKey, EncodePublicKey};
 use ed25519_dalek::SigningKey;
 use futures_util::{SinkExt, StreamExt};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-use rp_core::mando::{CRUZ, OPTIONS, PS};
+use rp_core::mando::{CREATE, CRUZ, OPTIONS, PS};
 use rp_core::{EstadoMando, LimitesOptions};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
@@ -481,6 +481,78 @@ async fn ranura_solo_el_dueno_manda_y_suelta() {
     assert!(e.tomar(3, rp_core::Rol::Jugador).is_some(), "libre, cualquier rol toma");
 }
 
+#[tokio::test(start_paused = true)]
+async fn ctl_un_panico_en_la_conexion_libera_la_ranura_y_suelta_una_vez() {
+    let b = banco();
+    b.estado.panico_en_estado.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (mut ws, _) = b.ws_con(&token("operador")).await;
+    enviar(&mut ws, estado_json(CRUZ)).await;
+    sleep(Duration::from_millis(5)).await;
+    let m = b.mandos();
+    let i = m.iter().position(|e| *e == con(CRUZ)).expect("llegó el estado antes del pánico");
+    assert_eq!(&m[i + 1..], &[EstadoMando::suelto()], "suelto exactamente una vez: {m:?}");
+    assert!(b.estado.ranura.lock().unwrap().is_none(), "la ranura quedó libre");
+    // Libre: hasta un rol menor la puede tomar (no recibe OCUPADO).
+    b.estado.panico_en_estado.store(false, std::sync::atomic::Ordering::SeqCst);
+    let (_ws2, r) = b.ws_con(&token("jugador")).await;
+    assert_eq!(r, json!({"t":"ok","rol":"jugador"}));
+}
+
+#[tokio::test(start_paused = true)]
+async fn ranura_una_tarea_cancelada_libera_y_suelta_una_vez() {
+    let b = banco();
+    let e = b.estado.clone();
+    let tarea = tokio::spawn(async move {
+        let (_dueno, _aviso) = e.tomar(7, rp_core::Rol::Operador).unwrap();
+        e.mandar(7, &con(CRUZ));
+        std::future::pending::<()>().await;
+    });
+    sleep(Duration::from_millis(5)).await;
+    assert_eq!(b.ultimo_mando(), con(CRUZ));
+    tarea.abort();
+    assert!(tarea.await.unwrap_err().is_cancelled());
+    let m = b.mandos();
+    let i = m.iter().position(|e| *e == con(CRUZ)).unwrap();
+    assert_eq!(&m[i + 1..], &[EstadoMando::suelto()], "suelto exactamente una vez: {m:?}");
+    assert!(b.estado.ranura.lock().unwrap().is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn ctl_exp_enorme_no_entra_en_panico_y_se_corta_al_tope() {
+    let b = banco();
+    let mut c = claims("operador");
+    c["exp"] = json!(u64::MAX);
+    let (mut ws, r) = b.ws_con(&firmar(&c)).await;
+    assert_eq!(r, json!({"t":"ok","rol":"operador"}));
+    enviar(&mut ws, estado_json(CRUZ)).await;
+    sleep(Duration::from_millis(5)).await;
+    assert_eq!(b.ultimo_mando(), con(CRUZ), "la conexión sigue viva");
+    let t = Instant::now();
+    assert_eq!(recibir(&mut ws).await, Some(json!({"t":"error","codigo":"VENCIDA"})));
+    let tardo = t.elapsed();
+    assert!(tardo >= ctl::TOPE_CONEXION - Duration::from_millis(10) && tardo <= ctl::TOPE_CONEXION, "{tardo:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn ctl_al_terminar_cuenta_los_descartados_del_filtro() {
+    let b = banco();
+    let (mut ws, _) = b.ws_con(&token("jugador")).await;
+    // Tres toques de PS y uno de Create: los cuatro descartados.
+    for botones in [PS, 0, PS, 0, PS, 0, CREATE, 0] {
+        enviar(&mut ws, estado_json(botones)).await;
+    }
+    sleep(Duration::from_millis(5)).await;
+    ws.close(None).await.unwrap();
+    sleep(Duration::from_millis(5)).await;
+    assert_eq!(b.estado.descartados(), 4);
+    // El operador no descarta nada: el total no cambia.
+    let (mut ws, _) = b.ws_con(&token("operador")).await;
+    enviar(&mut ws, estado_json(PS)).await;
+    ws.close(None).await.unwrap();
+    sleep(Duration::from_millis(5)).await;
+    assert_eq!(b.estado.descartados(), 4);
+}
+
 // ---------------------------------------------------------------- /interno
 
 fn auth(action: &str, protocol: &str, ip: &str, path: &str, token: &str) -> Value {
@@ -681,6 +753,15 @@ async fn salud_tiene_la_forma_de_video_salud() {
             "cpu": 0.0
         })
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn salud_informa_reposo() {
+    let b = banco();
+    b.metricas.estado(crate::metricas::EstadoSesion::Reposo);
+    let (_, cuerpo) = b.control("GET", "salud").await;
+    let v: Value = serde_json::from_str(&cuerpo).unwrap();
+    assert_eq!(v["sesion"], json!({"estado":"reposo","fps":0.0,"kbps":0,"perdidos":0,"ultimaReconexion":null}));
 }
 
 #[test]
