@@ -1579,6 +1579,75 @@ async fn turno_no_toca_al_operador() {
     assert!(tokio::time::timeout(Duration::from_millis(100), recibir(&mut ws)).await.is_err());
 }
 
+/// Cuerpo de `/control/turno` con la fila en pausa (`"mandos":false`, sin vistas).
+fn cuerpo_pausa(version: u64, jugador: Option<(&str, &str)>) -> String {
+    let j = jugador.map(|(sub, t)| json!({"sub":sub,"turnId":t})).unwrap_or(Value::Null);
+    json!({"version":version,"jugador":j,"vistas":[],"mandos":false}).to_string()
+}
+
+#[tokio::test(start_paused = true)]
+async fn turno_sin_mandos_corta_al_jugador_con_pausa_sin_cortarle_el_video() {
+    let b = banco_con_turno().await;
+    let whep = uuid(1);
+    assert_eq!(b.ver(&token_jugador("u1", "t1"), Some(&whep)).await, StatusCode::OK);
+    let (mut ws, _) = b.ws_con(&token_jugador("u1", "t1")).await;
+    enviar(&mut ws, json!({"t":"estado","botones":CRUZ,"l2":0,"r2":255,"lx":100,"ly":-100,"rx":0,"ry":0})).await;
+    sleep(Duration::from_millis(5)).await;
+    assert_ne!(b.ultimo_mando(), EstadoMando::suelto());
+    let (st, r) = b.turno(&cuerpo_pausa(2, Some(("u1", "t1")))).await;
+    assert_eq!((st, r.as_str()), (StatusCode::OK, r#"{"ok":true}"#));
+    // Cuando llega el 200, la PS5 ya recibió el todo suelto (botones, gatillos y palancas al centro).
+    assert_eq!(b.ultimo_mando(), EstadoMando::suelto());
+    assert_eq!(recibir(&mut ws).await, Some(json!({"t":"error","codigo":"PAUSA"})));
+    assert!(cerrado(&mut ws).await);
+    let m = b.mandos();
+    let i = m.iter().rposition(|e| *e != EstadoMando::suelto()).unwrap();
+    assert_eq!(&m[i + 1..], &[EstadoMando::suelto()], "suelto exactamente una vez: {m:?}");
+    assert_eq!(b.salud_jugador().await["mando"], Value::Null, "la ranura quedó libre");
+    // El video sigue: su WHEP no se expulsa y uno nuevo se autoriza (sin `id`: con otro, el de la misma
+    // cuenta reemplazaría al abierto).
+    assert!(b.expulsiones().await.is_empty(), "{:?}", b.expulsiones().await);
+    assert_eq!(b.ver(&token_jugador("u1", "t1"), None).await, StatusCode::OK);
+    // Durante la pausa, una conexión nueva recibe PAUSA sin tocar la PS5 (la web reintenta cada 2 s).
+    let antes = b.mandos().len();
+    let (mut ws, r) = b.ws_con(&token_jugador("u1", "t1")).await;
+    assert_eq!(r, json!({"t":"error","codigo":"PAUSA"}));
+    assert!(cerrado(&mut ws).await);
+    assert_eq!(b.mandos().len(), antes);
+    // Otro jugador sigue recibiendo TURNO.
+    let (_, r) = b.ws_con(&token_jugador("u2", "t2")).await;
+    assert_eq!(r, json!({"t":"error","codigo":"TURNO"}));
+    // Vuelven los mandos (otra versión, sin la clave): reconecta y manda.
+    b.empujar(3, Some(("u1", "t1"))).await;
+    let (mut ws, r) = b.ws_con(&token_jugador("u1", "t1")).await;
+    assert_eq!(r, json!({"t":"ok","rol":"jugador"}));
+    enviar(&mut ws, estado_json(L1)).await;
+    sleep(Duration::from_millis(5)).await;
+    assert_eq!(b.ultimo_mando(), con(L1));
+    // `"mandos":true` explícito también se acepta y no lo corta.
+    let cuerpo = json!({"version":4,"jugador":{"sub":"u1","turnId":"t1"},"vistas":[],"mandos":true}).to_string();
+    let (st, r) = b.turno(&cuerpo).await;
+    assert_eq!((st, r.as_str()), (StatusCode::OK, r#"{"ok":true}"#));
+    assert!(tokio::time::timeout(Duration::from_millis(100), recibir(&mut ws)).await.is_err(), "sin mensajes");
+    assert!(b.expulsiones().await.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn turno_sin_mandos_no_toca_al_operador_y_le_deja_entrar() {
+    let b = banco_con_turno().await;
+    let (mut ws, _) = b.ws_con(&token("operador")).await;
+    enviar(&mut ws, estado_json(PS)).await;
+    sleep(Duration::from_millis(5)).await;
+    let (st, _) = b.turno(&cuerpo_pausa(2, Some(("u1", "t1")))).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(b.ultimo_mando(), con(PS));
+    assert!(tokio::time::timeout(Duration::from_millis(100), recibir(&mut ws)).await.is_err());
+    drop(ws);
+    sleep(Duration::from_millis(5)).await;
+    let (_ws, r) = b.ws_con(&token_operador("op2")).await;
+    assert_eq!(r, json!({"t":"ok","rol":"operador"}), "en pausa el operador también entra");
+}
+
 #[tokio::test(start_paused = true)]
 async fn ctl_una_vista_recibe_rol_y_no_suelta_al_jugador() {
     let b = banco();

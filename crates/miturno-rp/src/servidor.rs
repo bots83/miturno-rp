@@ -7,8 +7,9 @@
 //!   una sesión abierta. Una cuenta (salvo el operador) tiene una sola sesión.
 //! - `GET /control/salud` y `POST /control/{reconectar,kick_on,kick_off,reposo,encender,turno}`: solo con
 //!   el token de control de la api (nunca con la credencial del navegador). `turno` recibe el turno
-//!   vigente y las vistas (`leer_autorizados`); al arrancar no hay ninguno (nada en disco). Después de
-//!   responder, expulsa en segundo plano las sesiones WHEP que ya no tienen video.
+//!   vigente, las vistas y si hay mandos (`leer_autorizados`; `"mandos":false` con la fila en pausa); al
+//!   arrancar no hay ninguno (nada en disco). Después de responder, expulsa en segundo plano las
+//!   sesiones WHEP que ya no tienen video.
 //!
 //! Nunca se registran credenciales, tokens ni el nombre de la conexión de casa.
 
@@ -470,9 +471,10 @@ async fn kick<S: SesionPs5>(e: &EstadoServidor<S>, verbo: &str) -> Response {
 }
 
 /// `POST /control/turno`: el turno vigente y las vistas que publica la api. `200` recién después de
-/// cortar al jugador que ya no corresponde; `409 VERSION` si la versión es menor que la guardada;
-/// `400 FORMATO` si el cuerpo no es el JSON exacto. Las sesiones WHEP que se quedaron sin video se
-/// expulsan en segundo plano (la respuesta no espera a la API de MediaMTX).
+/// cortar al jugador que ya no corresponde (o que se quedó sin mandos por la pausa); `409 VERSION` si
+/// la versión es menor que la guardada; `400 FORMATO` si el cuerpo no es el JSON exacto. Las sesiones
+/// WHEP que se quedaron sin video se expulsan en segundo plano (la respuesta no espera a la API de
+/// MediaMTX).
 async fn turno<S: SesionPs5>(State(e): State<Compartido<S>>, cuerpo: Bytes) -> Response {
     let Some(a) = std::str::from_utf8(&cuerpo).ok().and_then(|t| leer_autorizados(t).ok()) else {
         static LIM: crate::registro::Limitado = crate::registro::Limitado::new();
@@ -482,6 +484,7 @@ async fn turno<S: SesionPs5>(State(e): State<Compartido<S>>, cuerpo: Bytes) -> R
     let version = a.version;
     let turno = a.jugador.as_ref().map(|j| j.turn_id.clone());
     let vistas = a.vistas.len();
+    let pausa = if a.mandos { "" } else { ", sin mandos (pausa)" };
     match e.aplicar_turno(a) {
         Err(ctl::VersionVieja(guardada)) => {
             crate::info!("control/turno: versión {version} menor que la guardada ({guardada}); rechazada");
@@ -490,10 +493,14 @@ async fn turno<S: SesionPs5>(State(e): State<Compartido<S>>, cuerpo: Bytes) -> R
         Ok(hecho) => {
             if hecho.anterior != version {
                 let turno = turno.as_deref().unwrap_or("ninguno");
-                crate::info!("control/turno: v{version}, turno {turno}, {vistas} vistas");
+                crate::info!("control/turno: v{version}, turno {turno}, {vistas} vistas{pausa}");
             }
-            if let Some(id) = hecho.cortada {
-                crate::info!("control/turno: la conexión {id} ya no tiene turno; mandos cortados");
+            match hecho.cortada {
+                Some((id, ctl::Expulsion::Pausa)) => {
+                    crate::info!("control/turno: la conexión {id} queda sin mandos por la pausa; mandos cortados")
+                }
+                Some((id, _)) => crate::info!("control/turno: la conexión {id} ya no tiene turno; mandos cortados"),
+                None => {}
             }
             e.expulsar_whep(hecho.expulsar, "ya no tiene video");
             ok()

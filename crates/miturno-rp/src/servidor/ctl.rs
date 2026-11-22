@@ -4,13 +4,14 @@
 //!   Como mucho `MAX_SIN_AUTH` conexiones esperan `auth` a la vez, y `MAX_SIN_AUTH_POR_IP` de una
 //!   misma IP (la del cliente que pasa Caddy en `X-Forwarded-For`): las demás reciben 503 sin upgrade.
 //! - Con la credencial válida, `Autorizados::mandos` decide: el jugador solo manda si su `(sub, turnId)`
-//!   es el turno vigente que empujó la api por `/control/turno` (si no, `error TURNO`), la vista nunca
-//!   (`error ROL`) y el operador siempre. Rechazada así, la conexión no toma la ranura: una vista nunca
-//!   suelta lo que tenía el jugador.
+//!   es el turno vigente que empujó la api por `/control/turno` (si no, `error TURNO`) y la fila no está
+//!   en pausa (`"mandos":false`: `error PAUSA`), la vista nunca (`error ROL`) y el operador siempre.
+//!   Rechazada así, la conexión no toma la ranura: una vista nunca suelta lo que tenía el jugador.
 //! - Un solo controlador a la vez: una conexión válida de rol igual o mayor reemplaza a la anterior
 //!   (que recibe `reemplazado` con el rol de la nueva y se cierra); una de rol menor recibe `error OCUPADO`.
 //! - Si `/control/turno` deja al jugador que controla sin turno, se le suelta todo y se libera la ranura
 //!   antes de responder (con la ranura tomada, sin ventana), y la conexión recibe `error TURNO` y se cierra.
+//!   Si lo deja sin mandos por la pausa, lo mismo con `error PAUSA`: el video (WHEP) no se toca.
 //! - La actividad del jugador (`Actividad`) se mide con lo que llega a la PS5: cada `estado` aplicado
 //!   se registra, y el todo suelto (por silencio, reemplazo, corte o fin de la conexión) la suelta.
 //! - Cada mensaje válido es un latido. Con 500 ms de silencio se suelta todo (la conexión sigue); al
@@ -69,7 +70,8 @@ const MAX_MENSAJE: usize = 4 * 1024;
 /// Plazo para mandar el último mensaje antes de cerrar (un cliente que no lee no traba la tarea).
 const PLAZO_ENVIO: Duration = Duration::from_secs(1);
 
-/// Los rechazos de `/ctl` por turno (`TURNO`) o por rol (`ROL`): uno por minuto en el registro.
+/// Los rechazos de `/ctl` por turno (`TURNO`), por pausa (`PAUSA`) o por rol (`ROL`): uno por minuto en
+/// el registro.
 pub(super) static RECHAZO_MANDOS: crate::registro::Limitado = crate::registro::Limitado::new();
 
 /// Los rechazos `OCUPADO` de `/ctl`: uno por minuto en el registro.
@@ -82,6 +84,8 @@ pub(super) enum Expulsion {
     Reemplazada { por: Rol },
     /// El turno de este jugador dejó de ser el vigente (`/control/turno`).
     Revocada,
+    /// La fila está en pausa: el turno sigue, pero sin mandos (`/control/turno` con `"mandos":false`).
+    Pausa,
 }
 
 pub(super) struct Ocupante {
@@ -98,10 +102,14 @@ impl Ocupante {
         (self.rol == Rol::Jugador).then_some(self.turn_id.as_deref()).flatten()
     }
 
-    /// ¿Estos autorizados le siguen dando mandos? La regla es la de `/ctl` (`Autorizados::mandos_de`,
-    /// que usa también `Autorizados::mandos`).
-    fn sigue_autorizado(&self, a: &Autorizados) -> bool {
-        a.mandos_de(self.rol, &self.sub, self.turn_id.as_deref()).is_ok()
+    /// Si estos autorizados ya no le dan mandos, por qué se lo corta (`None`: sigue). La regla es la de
+    /// `/ctl` (`Autorizados::mandos_de`, que usa también `Autorizados::mandos`).
+    fn corte(&self, a: &Autorizados) -> Option<Expulsion> {
+        match a.mandos_de(self.rol, &self.sub, self.turn_id.as_deref()) {
+            Ok(()) => None,
+            Err("PAUSA") => Some(Expulsion::Pausa),
+            Err(_) => Some(Expulsion::Revocada),
+        }
     }
 }
 
@@ -126,12 +134,12 @@ impl Ranura {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct VersionVieja(pub(super) u64);
 
-/// Lo que hizo `/control/turno`: la versión que había, la conexión que cortó, si hubo, y las sesiones
-/// WHEP que ya no tienen video (para expulsar).
+/// Lo que hizo `/control/turno`: la versión que había, la conexión que cortó y por qué (`Revocada` o
+/// `Pausa`), si hubo, y las sesiones WHEP que ya no tienen video (para expulsar).
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct TurnoAplicado {
     pub(super) anterior: u64,
-    pub(super) cortada: Option<u64>,
+    pub(super) cortada: Option<(u64, Expulsion)>,
     pub(super) expulsar: Vec<String>,
 }
 
@@ -237,8 +245,8 @@ impl<S: SesionPs5> EstadoServidor<S> {
         f(&mut self.ranura.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
-    /// Toma el control si la credencial tiene mandos (`TURNO`/`ROL` si no) y no hay nadie o el actual
-    /// tiene un rol igual o menor (`OCUPADO` si no). Rechazada, no toca la ranura ni la PS5. Si no,
+    /// Toma el control si la credencial tiene mandos (`TURNO`/`PAUSA`/`ROL` si no) y no hay nadie o el
+    /// actual tiene un rol igual o menor (`OCUPADO` si no). Rechazada, no toca la ranura ni la PS5. Si no,
     /// suelta lo que haya dejado el anterior y le avisa. Devuelve el guardián de la ranura (ya armado,
     /// sin ventana en la que un pánico la deje tomada) y el aviso de expulsión de esta conexión.
     /// Todo con la ranura tomada: un `/control/turno` no puede colarse entre la autorización y la toma.
@@ -300,8 +308,8 @@ impl<S: SesionPs5> EstadoServidor<S> {
 
     /// Guarda el turno vigente de `/control/turno` (una versión igual se acepta: el empuje es
     /// idempotente) y fija el turno de la actividad. Con la misma ranura tomada, si el que controla
-    /// ya no tiene mandos, le suelta todo, libera la ranura y le avisa: cuando esto vuelve, la PS5 ya
-    /// no recibe nada de él.
+    /// ya no tiene mandos (otro turno o la fila en pausa), le suelta todo, libera la ranura y le avisa
+    /// por qué: cuando esto vuelve, la PS5 ya no recibe nada de él.
     pub(super) fn aplicar_turno(&self, a: Autorizados) -> Result<TurnoAplicado, VersionVieja> {
         let ahora = self.ahora_ms();
         self.con_ranura(|r| {
@@ -312,16 +320,16 @@ impl<S: SesionPs5> EstadoServidor<S> {
             r.autorizados = a;
             r.actividad.turno(r.autorizados.jugador.as_ref().map(|j| j.turn_id.as_str()), ahora);
             let expulsar = r.whep.no_autorizadas(&r.autorizados);
-            let autorizados = &r.autorizados;
-            let Some(o) = r.ocupante.take_if(|o| !o.sigue_autorizado(autorizados)) else {
+            let corte = r.ocupante.as_ref().and_then(|o| o.corte(&r.autorizados));
+            let (Some(motivo), Some(o)) = (corte, r.ocupante.take_if(|_| corte.is_some())) else {
                 return Ok(TurnoAplicado { anterior, cortada: None, expulsar });
             };
             self.sesion.poner_mando(&EstadoMando::suelto());
             if let Some(t) = o.turno_jugador() {
                 r.actividad.soltar(t, ahora);
             }
-            let _ = o.aviso.send(Expulsion::Revocada);
-            Ok(TurnoAplicado { anterior, cortada: Some(o.id), expulsar })
+            let _ = o.aviso.send(motivo);
+            Ok(TurnoAplicado { anterior, cortada: Some((o.id, motivo)), expulsar })
         })
     }
 
@@ -474,6 +482,8 @@ enum Fin {
     Reemplazada(Rol),
     /// `/control/turno` dejó a este jugador sin turno (ya se soltó todo y se liberó la ranura).
     Revocada,
+    /// `/control/turno` puso la fila en pausa: el mismo corte que `Revocada`, con otro aviso.
+    Pausa,
 }
 
 async fn conexion<S: SesionPs5>(e: Arc<EstadoServidor<S>>, mut socket: WebSocket, lugar: Lugar) {
@@ -504,8 +514,9 @@ async fn conexion<S: SesionPs5>(e: Arc<EstadoServidor<S>>, mut socket: WebSocket
         Ok(t) => t,
         Err(codigo) => {
             // `TURNO` y `ROL` los puede provocar cualquiera con una credencial válida (también se
-            // esperan en la carrera del arranque del turno) y `OCUPADO`, el jugador que reintenta con el
-            // operador al mando: limitados, como la credencial rechazada (cada uno con su límite).
+            // esperan en la carrera del arranque del turno), `PAUSA` el jugador que reintenta cada 2 s
+            // durante la pausa y `OCUPADO`, el jugador que reintenta con el operador al mando: limitados,
+            // como la credencial rechazada (cada uno con su límite).
             if codigo == "OCUPADO" {
                 crate::limitado!(6, RECHAZO_OCUPADO, "ctl: conexión {id} (rol={}) rechazada ({codigo})", nombre_rol(cred.rol));
             } else {
@@ -534,6 +545,7 @@ async fn conexion<S: SesionPs5>(e: Arc<EstadoServidor<S>>, mut socket: WebSocket
         Fin::Vencida => ("credencial vencida", Some(MsgServidor::error("VENCIDA"))),
         Fin::Reemplazada(por) => ("reemplazada", Some(MsgServidor::Reemplazado { por })),
         Fin::Revocada => ("turno terminado", Some(MsgServidor::error("TURNO"))),
+        Fin::Pausa => ("fila en pausa", Some(MsgServidor::error("PAUSA"))),
     };
     crate::info!("ctl: conexión {id} terminada ({motivo}; rol={}, descartados={descartados})", nombre_rol(cred.rol));
     if ultimo.is_some() {
@@ -563,6 +575,7 @@ async fn bucle<S: SesionPs5>(
             biased;
             expulsion = &mut *aviso => return match expulsion {
                 Ok(Expulsion::Reemplazada { por }) => Fin::Reemplazada(por),
+                Ok(Expulsion::Pausa) => Fin::Pausa,
                 // `Err`: la ranura soltó el aviso sin mandarlo (no debería pasar); igual se corta.
                 Ok(Expulsion::Revocada) | Err(_) => Fin::Revocada,
             },
