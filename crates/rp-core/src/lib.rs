@@ -1,5 +1,7 @@
 //! Lógica pura de miturno-rp: no depende de libchiaki ni de la red, así se prueba en cualquier máquina.
 
+pub mod actividad;
+pub mod autorizados;
 pub mod credencial;
 pub mod filtro;
 pub mod guardian;
@@ -8,6 +10,8 @@ pub mod mando;
 pub mod protocolo;
 pub mod reintento;
 
+pub use actividad::{es_actividad, Actividad, UMBRAL_GATILLO, UMBRAL_STICK};
+pub use autorizados::{leer_autorizados, Autorizados, ErrorAutorizados, JugadorVigente, MAX_SUB, MAX_VISTAS};
 pub use credencial::{validar, validar_con, ClaveVerificacion, Credencial, ErrorClave, ErrorCredencial, Rol};
 pub use filtro::Filtro;
 pub use guardian::Guardian;
