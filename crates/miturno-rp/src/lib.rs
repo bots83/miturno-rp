@@ -10,5 +10,6 @@ pub mod registro;
 pub mod salida;
 pub mod servidor;
 pub mod sesion;
+pub mod sincronia;
 pub mod sistema;
 pub mod vigia;
