@@ -3,8 +3,9 @@
 //! - `GET /ctl` (WebSocket, detrás de Caddy): los mandos de quien juega, con la credencial de turno.
 //! - `POST /interno/auth` (autenticación externa de MediaMTX) y `POST /interno/keyframe`: solo desde
 //!   la misma máquina y nunca a través del proxy.
-//! - `GET /control/salud` y `POST /control/{reconectar,kick_on,kick_off,reposo,encender}`: solo con el
-//!   token de control de la api (nunca con la credencial del navegador).
+//! - `GET /control/salud` y `POST /control/{reconectar,kick_on,kick_off,reposo,encender,turno}`: solo con
+//!   el token de control de la api (nunca con la credencial del navegador). `turno` recibe el turno
+//!   vigente y las vistas (`leer_autorizados`); al arrancar no hay ninguno (nada en disco).
 //!
 //! Nunca se registran credenciales, tokens ni el nombre de la conexión de casa.
 
@@ -25,7 +26,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use rp_core::{validar_con, ClaveVerificacion, Rol};
+use rp_core::{leer_autorizados, validar_con, ClaveVerificacion, Rol};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use subtle::ConstantTimeEq;
@@ -115,8 +116,8 @@ pub struct EstadoServidor<S: SesionPs5> {
     reloj_s: fn() -> u64,
     /// Origen del reloj monótono (en milisegundos) del filtro y del guardián.
     t0: Instant,
-    /// El único controlador que puede mandar a la PS5.
-    ranura: Mutex<Option<ctl::Ocupante>>,
+    /// El único controlador que puede mandar a la PS5, el turno vigente y la actividad del jugador.
+    ranura: Mutex<ctl::Ranura>,
     /// Lugares para conexiones de /ctl que todavía no se autenticaron (`ctl::MAX_SIN_AUTH` y
     /// `ctl::MAX_SIN_AUTH_POR_IP`).
     sin_auth: Arc<ctl::SinAuth>,
@@ -140,7 +141,7 @@ impl<S: SesionPs5> EstadoServidor<S> {
             sistema: p.sistema,
             reloj_s: p.reloj_s,
             t0: Instant::now(),
-            ranura: Mutex::new(None),
+            ranura: Mutex::new(ctl::Ranura::new()),
             sin_auth: ctl::SinAuth::new(),
             proximo_id: AtomicU64::new(1),
             cpu: Mutex::new(0.0),
@@ -170,6 +171,7 @@ pub fn rutas<S: SesionPs5>(estado: Compartido<S>) -> Router {
         .route("/control/encender", post(|State(e): State<Compartido<S>>| async move { ordenar(&e, Orden::Encender) }))
         .route("/control/kick_on", post(|State(e): State<Compartido<S>>| async move { kick(&e, "start").await }))
         .route("/control/kick_off", post(|State(e): State<Compartido<S>>| async move { kick(&e, "stop").await }))
+        .route("/control/turno", post(turno::<S>))
         .route_layer(middleware::from_fn_with_state(estado.clone(), con_token::<S>));
     Router::new().route("/ctl", get(ctl::ctl::<S>)).merge(interno).merge(control).with_state(estado)
 }
@@ -323,6 +325,46 @@ async fn kick<S: SesionPs5>(e: &EstadoServidor<S>, verbo: &str) -> Response {
     }
 }
 
+/// `POST /control/turno`: el turno vigente y las vistas que publica la api. `200` recién después de
+/// cortar al jugador que ya no corresponde; `409 VERSION` si la versión es menor que la guardada;
+/// `400 FORMATO` si el cuerpo no es el JSON exacto.
+async fn turno<S: SesionPs5>(State(e): State<Compartido<S>>, cuerpo: Bytes) -> Response {
+    let Some(a) = std::str::from_utf8(&cuerpo).ok().and_then(|t| leer_autorizados(t).ok()) else {
+        static LIM: crate::registro::Limitado = crate::registro::Limitado::new();
+        crate::limitado!(4, LIM, "control/turno: cuerpo inválido; rechazado");
+        return codigo(StatusCode::BAD_REQUEST, "FORMATO");
+    };
+    let version = a.version;
+    let turno = a.jugador.as_ref().map(|j| j.turn_id.clone());
+    let vistas = a.vistas.len();
+    match e.aplicar_turno(a) {
+        Err(ctl::VersionVieja(guardada)) => {
+            crate::info!("control/turno: versión {version} menor que la guardada ({guardada}); rechazada");
+            codigo(StatusCode::CONFLICT, "VERSION")
+        }
+        Ok(hecho) => {
+            if hecho.anterior != version {
+                let turno = turno.as_deref().unwrap_or("ninguno");
+                crate::info!("control/turno: v{version}, turno {turno}, {vistas} vistas");
+            }
+            if let Some(id) = hecho.cortada {
+                crate::info!("control/turno: la conexión {id} ya no tiene turno; mandos cortados");
+            }
+            ok()
+        }
+    }
+}
+
+/// `VideoSalud.jugador`: `version` 0 (nada empujado) es `null`; `mando`, el rol de quien controla.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct SaludJugador {
+    version: Option<u64>,
+    turn_id: Option<String>,
+    mando: Option<&'static str>,
+    inactivo_ms: Option<u64>,
+}
+
 /// `VideoSalud.kick` (los nombres y valores los fija el tipo de la api).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Kick {
@@ -350,6 +392,7 @@ struct VideoSalud {
     mediamtx: bool,
     turn: bool,
     cpu: f64,
+    jugador: SaludJugador,
 }
 
 async fn salud<S: SesionPs5>(State(e): State<Compartido<S>>) -> Json<VideoSalud> {
@@ -362,5 +405,6 @@ async fn salud<S: SesionPs5>(State(e): State<Compartido<S>>) -> Json<VideoSalud>
         mediamtx: activo(1) == "active",
         turn: activo(2) == "active",
         cpu: *e.cpu.lock().unwrap_or_else(|e| e.into_inner()),
+        jugador: e.salud_jugador(),
     })
 }

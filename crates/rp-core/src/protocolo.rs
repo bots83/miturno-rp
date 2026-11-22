@@ -20,7 +20,8 @@ pub enum MsgCliente {
 pub enum MsgServidor {
     Ok { rol: Rol },
     Error { codigo: String },
-    Reemplazado,
+    /// Otra conexión tomó el mando; `por` es su rol (el admin de F1 mira solo `t`).
+    Reemplazado { por: Rol },
 }
 
 impl MsgServidor {
@@ -83,7 +84,11 @@ mod tests {
         assert_eq!(MsgServidor::Ok { rol: Rol::Jugador }.a_json(), r#"{"t":"ok","rol":"jugador"}"#);
         assert_eq!(MsgServidor::Ok { rol: Rol::Vista }.a_json(), r#"{"t":"ok","rol":"vista"}"#);
         assert_eq!(MsgServidor::error("VENCIDA").a_json(), r#"{"t":"error","codigo":"VENCIDA"}"#);
-        assert_eq!(MsgServidor::Reemplazado.a_json(), r#"{"t":"reemplazado"}"#);
+        assert_eq!(
+            MsgServidor::Reemplazado { por: Rol::Operador }.a_json(),
+            r#"{"t":"reemplazado","por":"operador"}"#
+        );
+        assert_eq!(MsgServidor::Reemplazado { por: Rol::Jugador }.a_json(), r#"{"t":"reemplazado","por":"jugador"}"#);
     }
 
     #[test]
@@ -91,7 +96,7 @@ mod tests {
         for m in [
             MsgServidor::Ok { rol: Rol::Vista },
             MsgServidor::error("FORMATO"),
-            MsgServidor::Reemplazado,
+            MsgServidor::Reemplazado { por: Rol::Jugador },
         ] {
             assert_eq!(serde_json::from_str::<MsgServidor>(&m.a_json()).unwrap(), m);
         }

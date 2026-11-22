@@ -3,8 +3,16 @@
 //! - El primer mensaje tiene que ser `auth` en menos de 2 s; si no, `error FORMATO` y se cierra.
 //!   Como mucho `MAX_SIN_AUTH` conexiones esperan `auth` a la vez, y `MAX_SIN_AUTH_POR_IP` de una
 //!   misma IP (la del cliente que pasa Caddy en `X-Forwarded-For`): las demás reciben 503 sin upgrade.
+//! - Con la credencial válida, `Autorizados::mandos` decide: el jugador solo manda si su `(sub, turnId)`
+//!   es el turno vigente que empujó la api por `/control/turno` (si no, `error TURNO`), la vista nunca
+//!   (`error ROL`) y el operador siempre. Rechazada así, la conexión no toma la ranura: una vista nunca
+//!   suelta lo que tenía el jugador.
 //! - Un solo controlador a la vez: una conexión válida de rol igual o mayor reemplaza a la anterior
-//!   (que recibe `reemplazado` y se cierra); una de rol menor recibe `error OCUPADO`.
+//!   (que recibe `reemplazado` con el rol de la nueva y se cierra); una de rol menor recibe `error OCUPADO`.
+//! - Si `/control/turno` deja al jugador que controla sin turno, se le suelta todo y se libera la ranura
+//!   antes de responder (con la ranura tomada, sin ventana), y la conexión recibe `error TURNO` y se cierra.
+//! - La actividad del jugador (`Actividad`) se mide con lo que llega a la PS5: cada `estado` aplicado
+//!   se registra, y el todo suelto (por silencio, reemplazo, corte o fin de la conexión) la suelta.
 //! - Cada mensaje válido es un latido. Con 500 ms de silencio se suelta todo (la conexión sigue); al
 //!   cerrar, al llegar un mensaje inválido, al ser reemplazada o al vencer la credencial, también.
 //!   Si la conexión vuelve después de un silencio (un hipo de red), el primer mensaje válido que no
@@ -28,7 +36,10 @@ use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpg
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use rp_core::{leer_mensaje, validar_con, EstadoMando, Filtro, Guardian, MsgCliente, MsgServidor, Rol};
+use rp_core::{
+    leer_mensaje, validar_con, Actividad, Autorizados, Credencial, EstadoMando, Filtro, Guardian, MsgCliente,
+    MsgServidor, Rol,
+};
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{sleep_until, timeout, Instant};
 
@@ -57,10 +68,66 @@ const MAX_MENSAJE: usize = 4 * 1024;
 /// Plazo para mandar el último mensaje antes de cerrar (un cliente que no lee no traba la tarea).
 const PLAZO_ENVIO: Duration = Duration::from_secs(1);
 
+/// Por qué una conexión pierde la ranura (el aviso que recibe).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Expulsion {
+    /// Otra conexión de rol igual o mayor tomó el mando.
+    Reemplazada { por: Rol },
+    /// El turno de este jugador dejó de ser el vigente (`/control/turno`).
+    Revocada,
+}
+
 pub(super) struct Ocupante {
     id: u64,
     rol: Rol,
-    reemplazo: oneshot::Sender<()>,
+    sub: String,
+    turn_id: Option<String>,
+    aviso: oneshot::Sender<Expulsion>,
+}
+
+impl Ocupante {
+    /// El turno del jugador que controla (la actividad solo mide jugadores).
+    fn turno_jugador(&self) -> Option<&str> {
+        (self.rol == Rol::Jugador).then_some(self.turn_id.as_deref()).flatten()
+    }
+
+    /// ¿Estos autorizados le siguen dando mandos? La regla es la de `/ctl` (`Autorizados::mandos`); de
+    /// la credencial solo importan rol, `sub` y `turnId`.
+    fn sigue_autorizado(&self, a: &Autorizados) -> bool {
+        let c = Credencial {
+            sub: self.sub.clone(),
+            rol: self.rol,
+            turn_id: self.turn_id.clone(),
+            exp: 0,
+            jti: String::new(),
+        };
+        a.mandos(&c).is_ok()
+    }
+}
+
+/// Lo que protege el mismo candado: quién controla, quién puede controlar y la actividad del jugador.
+/// Al arrancar no hay nadie autorizado ni actividad (nada se guarda en disco).
+pub(super) struct Ranura {
+    pub(super) ocupante: Option<Ocupante>,
+    autorizados: Autorizados,
+    actividad: Actividad,
+}
+
+impl Ranura {
+    pub(super) fn new() -> Self {
+        Self { ocupante: None, autorizados: Autorizados::vacio(), actividad: Actividad::new() }
+    }
+}
+
+/// `/control/turno` con una versión menor que la guardada (que va adentro).
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct VersionVieja(pub(super) u64);
+
+/// Lo que hizo `/control/turno`: la versión que había y la conexión que cortó, si hubo.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct TurnoAplicado {
+    pub(super) anterior: u64,
+    pub(super) cortada: Option<u64>,
 }
 
 /// Lugares para las conexiones que todavía no se autenticaron: el tope global y el de cada IP.
@@ -161,47 +228,110 @@ impl<S: SesionPs5> EstadoServidor<S> {
         self.t0.elapsed().as_millis() as u64
     }
 
-    fn con_ranura<R>(&self, f: impl FnOnce(&mut Option<Ocupante>) -> R) -> R {
+    fn con_ranura<R>(&self, f: impl FnOnce(&mut Ranura) -> R) -> R {
         f(&mut self.ranura.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
-    /// Toma el control si no hay nadie o el actual tiene un rol igual o menor. Suelta lo que haya
-    /// dejado el anterior y le avisa. Devuelve el guardián de la ranura (ya armado, sin ventana en la
-    /// que un pánico la deje tomada) y el aviso de reemplazo de esta conexión.
-    pub(super) fn tomar(self: &Arc<Self>, id: u64, rol: Rol) -> Option<(Dueno<S>, oneshot::Receiver<()>)> {
+    /// Toma el control si la credencial tiene mandos (`TURNO`/`ROL` si no) y no hay nadie o el actual
+    /// tiene un rol igual o menor (`OCUPADO` si no). Rechazada, no toca la ranura ni la PS5. Si no,
+    /// suelta lo que haya dejado el anterior y le avisa. Devuelve el guardián de la ranura (ya armado,
+    /// sin ventana en la que un pánico la deje tomada) y el aviso de expulsión de esta conexión.
+    /// Todo con la ranura tomada: un `/control/turno` no puede colarse entre la autorización y la toma.
+    pub(super) fn tomar(
+        self: &Arc<Self>,
+        id: u64,
+        cred: &Credencial,
+    ) -> Result<(Dueno<S>, oneshot::Receiver<Expulsion>), &'static str> {
+        let ahora = self.ahora_ms();
         let rx = self.con_ranura(|r| {
-            if r.as_ref().is_some_and(|o| rol < o.rol) {
-                return None;
+            r.autorizados.mandos(cred)?;
+            if r.ocupante.as_ref().is_some_and(|o| cred.rol < o.rol) {
+                return Err("OCUPADO");
             }
-            if let Some(viejo) = r.take() {
+            if let Some(viejo) = r.ocupante.take() {
                 crate::info!("ctl: la conexión {id} reemplaza a la {}", viejo.id);
-                let _ = viejo.reemplazo.send(());
+                if let Some(t) = viejo.turno_jugador() {
+                    r.actividad.soltar(t, ahora);
+                }
+                let _ = viejo.aviso.send(Expulsion::Reemplazada { por: cred.rol });
             }
             let (tx, rx) = oneshot::channel();
-            *r = Some(Ocupante { id, rol, reemplazo: tx });
+            r.ocupante =
+                Some(Ocupante { id, rol: cred.rol, sub: cred.sub.clone(), turn_id: cred.turn_id.clone(), aviso: tx });
             self.sesion.poner_mando(&EstadoMando::suelto());
-            Some(rx)
+            Ok(rx)
         })?;
-        Some((Dueno { e: self.clone(), id }, rx))
+        Ok((Dueno { e: self.clone(), id }, rx))
     }
 
-    /// Pasa el estado a la PS5 solo si esta conexión es la que controla.
+    /// Pasa el estado a la PS5 solo si esta conexión es la que controla; si es un jugador, lo registra
+    /// en la actividad (un estado sin actividad, como el todo suelto por silencio, equivale a
+    /// `Actividad::soltar`).
     pub(super) fn mandar(&self, id: u64, estado: &EstadoMando) {
+        let ahora = self.ahora_ms();
         self.con_ranura(|r| {
-            if r.as_ref().is_some_and(|o| o.id == id) {
+            if let Some(o) = r.ocupante.as_ref().filter(|o| o.id == id) {
                 self.sesion.poner_mando(estado);
+                if let Some(t) = o.turno_jugador() {
+                    r.actividad.registrar(t, estado, ahora);
+                }
             }
         });
     }
 
     /// Suelta todo y libera la ranura, si esta conexión todavía la tiene.
     pub(super) fn soltar(&self, id: u64) {
+        let ahora = self.ahora_ms();
         self.con_ranura(|r| {
-            if r.as_ref().is_some_and(|o| o.id == id) {
+            if let Some(o) = r.ocupante.as_ref().filter(|o| o.id == id) {
                 self.sesion.poner_mando(&EstadoMando::suelto());
-                *r = None;
+                if let Some(t) = o.turno_jugador() {
+                    r.actividad.soltar(t, ahora);
+                }
+                r.ocupante = None;
             }
         });
+    }
+
+    /// Guarda el turno vigente de `/control/turno` (una versión igual se acepta: el empuje es
+    /// idempotente) y fija el turno de la actividad. Con la misma ranura tomada, si el que controla
+    /// ya no tiene mandos, le suelta todo, libera la ranura y le avisa: cuando esto vuelve, la PS5 ya
+    /// no recibe nada de él.
+    pub(super) fn aplicar_turno(&self, a: Autorizados) -> Result<TurnoAplicado, VersionVieja> {
+        let ahora = self.ahora_ms();
+        self.con_ranura(|r| {
+            let anterior = r.autorizados.version;
+            if a.version < anterior {
+                return Err(VersionVieja(anterior));
+            }
+            r.autorizados = a;
+            r.actividad.turno(r.autorizados.jugador.as_ref().map(|j| j.turn_id.as_str()), ahora);
+            let autorizados = &r.autorizados;
+            let Some(o) = r.ocupante.take_if(|o| !o.sigue_autorizado(autorizados)) else {
+                return Ok(TurnoAplicado { anterior, cortada: None });
+            };
+            self.sesion.poner_mando(&EstadoMando::suelto());
+            if let Some(t) = o.turno_jugador() {
+                r.actividad.soltar(t, ahora);
+            }
+            let _ = o.aviso.send(Expulsion::Revocada);
+            Ok(TurnoAplicado { anterior, cortada: Some(o.id) })
+        })
+    }
+
+    /// `VideoSalud.jugador`: el turno vigente guardado, quién controla y la inactividad del jugador.
+    pub(super) fn salud_jugador(&self) -> super::SaludJugador {
+        let ahora = self.ahora_ms();
+        self.con_ranura(|r| super::SaludJugador {
+            version: (r.autorizados.version != 0).then_some(r.autorizados.version),
+            turn_id: r.autorizados.jugador.as_ref().map(|j| j.turn_id.clone()),
+            mando: r.ocupante.as_ref().and_then(|o| match o.rol {
+                Rol::Jugador => Some("jugador"),
+                Rol::Operador => Some("operador"),
+                Rol::Vista => None,
+            }),
+            inactivo_ms: r.actividad.inactivo_ms(ahora),
+        })
     }
 }
 
@@ -293,7 +423,9 @@ enum Fin {
     Cerrada,
     Formato,
     Vencida,
-    Reemplazada,
+    Reemplazada(Rol),
+    /// `/control/turno` dejó a este jugador sin turno (ya se soltó todo y se liberó la ranura).
+    Revocada,
 }
 
 async fn conexion<S: SesionPs5>(e: Arc<EstadoServidor<S>>, mut socket: WebSocket, lugar: Lugar) {
@@ -320,9 +452,12 @@ async fn conexion<S: SesionPs5>(e: Arc<EstadoServidor<S>>, mut socket: WebSocket
             return despedir(socket, Some(MsgServidor::error(err.codigo()))).await;
         }
     };
-    let Some((dueno, mut reemplazo)) = e.tomar(id, cred.rol) else {
-        crate::info!("ctl: conexión {id} (rol={}) rechazada: hay un controlador de rol mayor", nombre_rol(cred.rol));
-        return despedir(socket, Some(MsgServidor::error("OCUPADO"))).await;
+    let (dueno, mut aviso) = match e.tomar(id, &cred) {
+        Ok(t) => t,
+        Err(codigo) => {
+            crate::info!("ctl: conexión {id} (rol={}) rechazada ({codigo})", nombre_rol(cred.rol));
+            return despedir(socket, Some(MsgServidor::error(codigo))).await;
+        }
     };
     // `exp` es hora de pared: se pasa una sola vez a un plazo del reloj monótono, con tope (un `exp`
     // enorme desbordaría el `Instant`).
@@ -333,7 +468,7 @@ async fn conexion<S: SesionPs5>(e: Arc<EstadoServidor<S>>, mut socket: WebSocket
     crate::info!("ctl: conexión {id} (rol={}) controla la PS5", nombre_rol(cred.rol));
 
     let mut filtro = Filtro::new(cred.rol);
-    let fin = bucle(&e, id, &mut filtro, &mut socket, &mut reemplazo, vence).await;
+    let fin = bucle(&e, id, &mut filtro, &mut socket, &mut aviso, vence).await;
     // Primero se suelta todo (si todavía controla) y recién después se habla con el cliente.
     drop(dueno);
     let descartados = filtro.descartados();
@@ -342,7 +477,8 @@ async fn conexion<S: SesionPs5>(e: Arc<EstadoServidor<S>>, mut socket: WebSocket
         Fin::Cerrada => ("cerrada", None),
         Fin::Formato => ("mensaje inválido", Some(MsgServidor::error("FORMATO"))),
         Fin::Vencida => ("credencial vencida", Some(MsgServidor::error("VENCIDA"))),
-        Fin::Reemplazada => ("reemplazada", Some(MsgServidor::Reemplazado)),
+        Fin::Reemplazada(por) => ("reemplazada", Some(MsgServidor::Reemplazado { por })),
+        Fin::Revocada => ("turno terminado", Some(MsgServidor::error("TURNO"))),
     };
     crate::info!("ctl: conexión {id} terminada ({motivo}; rol={}, descartados={descartados})", nombre_rol(cred.rol));
     if ultimo.is_some() {
@@ -355,7 +491,7 @@ async fn bucle<S: SesionPs5>(
     id: u64,
     filtro: &mut Filtro,
     socket: &mut WebSocket,
-    reemplazo: &mut oneshot::Receiver<()>,
+    aviso: &mut oneshot::Receiver<Expulsion>,
     vence: Instant,
 ) -> Fin {
     let mut guardian = Guardian::new(SILENCIO_MS);
@@ -370,12 +506,17 @@ async fn bucle<S: SesionPs5>(
         let silencio = (!suelto_por_silencio).then(|| ms(ultimo + SILENCIO_MS));
         tokio::select! {
             biased;
-            _ = &mut *reemplazo => return Fin::Reemplazada,
+            expulsion = &mut *aviso => return match expulsion {
+                Ok(Expulsion::Reemplazada { por }) => Fin::Reemplazada(por),
+                // `Err`: la ranura soltó el aviso sin mandarlo (no debería pasar); igual se corta.
+                Ok(Expulsion::Revocada) | Err(_) => Fin::Revocada,
+            },
             _ = sleep_until(vence) => return Fin::Vencida,
             _ = sleep_until(silencio.unwrap_or(vence)), if silencio.is_some() => {
                 let ahora = e.ahora_ms();
                 if guardian.vencido(ahora) {
                     crate::depurar!("ctl: conexión {id}: {SILENCIO_MS} ms sin mensajes; todo suelto");
+                    // Sin actividad: para la del jugador, `mandar` equivale a `Actividad::soltar`.
                     let salida = filtro.aplicar(&EstadoMando::suelto(), ahora);
                     e.mandar(id, &salida);
                     suelto_por_silencio = true;

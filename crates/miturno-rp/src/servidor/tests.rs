@@ -48,8 +48,34 @@ fn par(semilla: u8) -> (String, String) {
     )
 }
 
+/// Claims de una credencial de `u1`; la de jugador, del turno `t1`.
 fn claims(rol: &str) -> Value {
-    json!({"iss":"miturno","aud":"miturno-video","sub":"u1","rol":rol,"iat":AHORA - 10,"exp":AHORA + 3600,"jti":"j1"})
+    let mut c = json!({"iss":"miturno","aud":"miturno-video","sub":"u1","rol":rol,"iat":AHORA - 10,"exp":AHORA + 3600,"jti":"j1"});
+    if rol == "jugador" {
+        c["turnId"] = json!("t1");
+    }
+    c
+}
+
+/// Credencial de jugador de la cuenta `sub` para el turno `turno`.
+fn token_jugador(sub: &str, turno: &str) -> String {
+    let mut c = claims("jugador");
+    c["sub"] = json!(sub);
+    c["turnId"] = json!(turno);
+    firmar(&c)
+}
+
+/// Credencial de vista de la cuenta `sub` (sin `turnId`).
+fn token_vista(sub: &str) -> String {
+    let mut c = claims("vista");
+    c["sub"] = json!(sub);
+    firmar(&c)
+}
+
+/// Cuerpo de `/control/turno` sin vistas.
+fn cuerpo_turno(version: u64, jugador: Option<(&str, &str)>) -> String {
+    let j = jugador.map(|(sub, t)| json!({"sub":sub,"turnId":t})).unwrap_or(Value::Null);
+    json!({"version":version,"jugador":j,"vistas":[]}).to_string()
 }
 
 fn firmar(c: &Value) -> String {
@@ -98,6 +124,13 @@ struct Banco {
     ordenes: mpsc::Receiver<Orden>,
     metricas: Arc<Metricas>,
     conexiones: mpsc::Sender<(DuplexStream, SocketAddr)>,
+}
+
+/// Banco con el turno `(u1, t1)` ya empujado (versión 1): el de `token("jugador")`.
+async fn banco_con_turno() -> Banco {
+    let b = banco();
+    b.empujar(1, Some(("u1", "t1"))).await;
+    b
 }
 
 fn banco() -> Banco {
@@ -180,6 +213,25 @@ impl Banco {
         self.pedir(metodo, &format!("/control/{accion}"), local(), Some(&bearer), "").await
     }
 
+    /// `POST /control/turno` con el token de control.
+    async fn turno(&self, cuerpo: &str) -> (StatusCode, String) {
+        let bearer = format!("Bearer {TOKEN_CONTROL}");
+        self.pedir("POST", "/control/turno", local(), Some(&bearer), cuerpo).await
+    }
+
+    /// Empuja el turno vigente y exige `200 {"ok":true}`.
+    async fn empujar(&self, version: u64, jugador: Option<(&str, &str)>) {
+        let (st, cuerpo) = self.turno(&cuerpo_turno(version, jugador)).await;
+        assert_eq!((st, cuerpo.as_str()), (StatusCode::OK, r#"{"ok":true}"#), "empuje v{version}");
+    }
+
+    /// `jugador` de la salud.
+    async fn salud_jugador(&self) -> Value {
+        let (st, cuerpo) = self.control("GET", "salud").await;
+        assert_eq!(st, StatusCode::OK);
+        serde_json::from_str::<Value>(&cuerpo).unwrap()["jugador"].clone()
+    }
+
     async fn auth_mediamtx(&self, cuerpo: Value) -> StatusCode {
         self.pedir("POST", "/interno/auth", local(), None, &cuerpo.to_string()).await.0
     }
@@ -203,6 +255,12 @@ async fn recibir(ws: &mut Ws) -> Option<Value> {
 /// El servidor cerró la conexión (sin mandar nada más).
 async fn cerrado(ws: &mut Ws) -> bool {
     tokio::time::timeout(Duration::from_millis(100), recibir(ws)).await.is_ok_and(|r| r.is_none())
+}
+
+/// Credencial ya validada de `u1` (la de jugador, del turno `t1`).
+fn cred(rol: rp_core::Rol) -> rp_core::Credencial {
+    let turn_id = (rol == rp_core::Rol::Jugador).then(|| "t1".to_string());
+    rp_core::Credencial { sub: "u1".into(), rol, turn_id, exp: AHORA + 3600, jti: "j1".into() }
 }
 
 fn estado_json(botones: u32) -> Value {
@@ -273,7 +331,7 @@ async fn ctl_estado_con_ps_de_operador_llega_a_la_sesion() {
 
 #[tokio::test(start_paused = true)]
 async fn ctl_el_filtro_del_jugador_se_aplica_antes_de_la_sesion() {
-    let b = banco();
+    let b = banco_con_turno().await;
     let (mut ws, r) = b.ws_con(&token("jugador")).await;
     assert_eq!(r, json!({"t":"ok","rol":"jugador"}));
     enviar(&mut ws, estado_json(PS | CRUZ)).await;
@@ -337,7 +395,7 @@ async fn ctl_si_el_jugador_solto_durante_el_hueco_el_estado_nuevo_manda() {
 
 #[tokio::test(start_paused = true)]
 async fn ctl_el_jugador_restaurado_tampoco_pasa_ps() {
-    let b = banco();
+    let b = banco_con_turno().await;
     let (mut ws, _) = b.ws_con(&token("jugador")).await;
     enviar(&mut ws, estado_json(CRUZ | PS)).await;
     sleep(Duration::from_millis(600)).await;
@@ -414,7 +472,7 @@ async fn ctl_una_segunda_conexion_valida_reemplaza_a_la_primera() {
 
     let (mut ws2, r2) = b.ws_con(&token("operador")).await;
     assert_eq!(r2, json!({"t":"ok","rol":"operador"}));
-    assert_eq!(recibir(&mut ws1).await, Some(json!({"t":"reemplazado"})));
+    assert_eq!(recibir(&mut ws1).await, Some(json!({"t":"reemplazado","por":"operador"})));
     assert!(cerrado(&mut ws1).await);
     assert_eq!(b.ultimo_mando(), EstadoMando::suelto(), "al reemplazar se suelta lo de la anterior");
 
@@ -438,7 +496,7 @@ async fn ctl_la_conexion_reemplazada_ya_no_manda() {
 
 #[tokio::test(start_paused = true)]
 async fn ctl_un_rol_menor_no_reemplaza_y_recibe_ocupado() {
-    let b = banco();
+    let b = banco_con_turno().await;
     let (mut ws1, _) = b.ws_con(&token("operador")).await;
     let (_ws2, r) = b.ws_con(&token("jugador")).await;
     assert_eq!(r, json!({"t":"error","codigo":"OCUPADO"}));
@@ -471,7 +529,7 @@ async fn ctl_mensaje_invalido_suelta_y_cierra_con_formato() {
 
 #[tokio::test(start_paused = true)]
 async fn ctl_options_del_jugador_sigue_apretado_sin_soltarse_a_los_2_s() {
-    let b = banco();
+    let b = banco_con_turno().await;
     let (mut ws, _) = b.ws_con(&token("jugador")).await;
     enviar(&mut ws, estado_json(OPTIONS)).await;
     sleep(Duration::from_millis(5)).await;
@@ -515,25 +573,25 @@ async fn ctl_sin_ruta_de_websocket_en_otro_lado() {
 
 #[tokio::test(start_paused = true)]
 async fn ranura_solo_el_dueno_manda_y_suelta() {
-    let b = banco();
+    let b = banco_con_turno().await;
     let e = &b.estado;
-    let _r1 = e.tomar(1, rp_core::Rol::Operador).unwrap();
-    let _r2 = e.tomar(2, rp_core::Rol::Operador).unwrap();
+    let _r1 = e.tomar(1, &cred(rp_core::Rol::Operador)).unwrap();
+    let _r2 = e.tomar(2, &cred(rp_core::Rol::Operador)).unwrap();
     let antes = b.mandos().len();
     e.mandar(1, &con(CRUZ));
     e.soltar(1);
     assert_eq!(b.mandos().len(), antes, "la conexión reemplazada ni manda ni suelta");
     e.mandar(2, &con(PS));
     assert_eq!(b.ultimo_mando(), con(PS));
-    assert!(e.tomar(3, rp_core::Rol::Jugador).is_none(), "un rol menor no toma");
+    assert_eq!(e.tomar(3, &cred(rp_core::Rol::Jugador)).err(), Some("OCUPADO"), "un rol menor no toma");
     e.soltar(2);
     assert_eq!(b.ultimo_mando(), EstadoMando::suelto());
-    assert!(e.tomar(3, rp_core::Rol::Jugador).is_some(), "libre, cualquier rol toma");
+    assert!(e.tomar(3, &cred(rp_core::Rol::Jugador)).is_ok(), "libre, el jugador del turno toma");
 }
 
 #[tokio::test(start_paused = true)]
 async fn ctl_un_panico_en_la_conexion_libera_la_ranura_y_suelta_una_vez() {
-    let b = banco();
+    let b = banco_con_turno().await;
     b.estado.panico_en_estado.store(true, std::sync::atomic::Ordering::SeqCst);
     let (mut ws, _) = b.ws_con(&token("operador")).await;
     enviar(&mut ws, estado_json(CRUZ)).await;
@@ -541,7 +599,7 @@ async fn ctl_un_panico_en_la_conexion_libera_la_ranura_y_suelta_una_vez() {
     let m = b.mandos();
     let i = m.iter().position(|e| *e == con(CRUZ)).expect("llegó el estado antes del pánico");
     assert_eq!(&m[i + 1..], &[EstadoMando::suelto()], "suelto exactamente una vez: {m:?}");
-    assert!(b.estado.ranura.lock().unwrap().is_none(), "la ranura quedó libre");
+    assert!(b.estado.ranura.lock().unwrap().ocupante.is_none(), "la ranura quedó libre");
     // Libre: hasta un rol menor la puede tomar (no recibe OCUPADO).
     b.estado.panico_en_estado.store(false, std::sync::atomic::Ordering::SeqCst);
     let (_ws2, r) = b.ws_con(&token("jugador")).await;
@@ -553,7 +611,7 @@ async fn ranura_una_tarea_cancelada_libera_y_suelta_una_vez() {
     let b = banco();
     let e = b.estado.clone();
     let tarea = tokio::spawn(async move {
-        let (_dueno, _aviso) = e.tomar(7, rp_core::Rol::Operador).unwrap();
+        let (_dueno, _aviso) = e.tomar(7, &cred(rp_core::Rol::Operador)).unwrap();
         e.mandar(7, &con(CRUZ));
         std::future::pending::<()>().await;
     });
@@ -564,7 +622,7 @@ async fn ranura_una_tarea_cancelada_libera_y_suelta_una_vez() {
     let m = b.mandos();
     let i = m.iter().position(|e| *e == con(CRUZ)).unwrap();
     assert_eq!(&m[i + 1..], &[EstadoMando::suelto()], "suelto exactamente una vez: {m:?}");
-    assert!(b.estado.ranura.lock().unwrap().is_none());
+    assert!(b.estado.ranura.lock().unwrap().ocupante.is_none());
 }
 
 #[tokio::test(start_paused = true)]
@@ -776,7 +834,7 @@ async fn ctl_una_credencial_mas_larga_que_las_de_la_api_se_corta_a_la_hora_y_30_
 
 #[tokio::test(start_paused = true)]
 async fn ctl_al_terminar_cuenta_los_descartados_del_filtro() {
-    let b = banco();
+    let b = banco_con_turno().await;
     let (mut ws, _) = b.ws_con(&token("jugador")).await;
     // Tres toques de PS y uno de Create: los cuatro descartados.
     for botones in [PS, 0, PS, 0, PS, 0, CREATE, 0] {
@@ -991,7 +1049,8 @@ async fn salud_tiene_la_forma_de_video_salud() {
             "kick": {"encendido":true,"estado":"transmitiendo"},
             "mediamtx": true,
             "turn": false,
-            "cpu": 0.0
+            "cpu": 0.0,
+            "jugador": {"version":null,"turnId":null,"mando":null,"inactivoMs":null}
         })
     );
 }
@@ -1071,4 +1130,266 @@ fn el_token_de_control_se_lee_una_vez_y_no_se_muestra() {
     assert!(e.contains("corto.token") && !e.contains("abc123"), "{e}");
     assert!(cargar_token_control(&archivo("vacio.token", "\n")).is_err());
     assert!(cargar_token_control(std::path::Path::new("/no/existe.token")).is_err());
+}
+
+// ---------------------------------------------------------------- /control/turno
+
+#[tokio::test(start_paused = true)]
+async fn turno_sin_token_o_con_token_malo_es_401() {
+    let b = banco();
+    let cuerpo = cuerpo_turno(1, Some(("u1", "t1")));
+    let malos = [None, Some("Bearer otro".to_string()), Some(format!("Bearer {}", token("operador")))];
+    for auth in &malos {
+        let (st, r) = b.pedir("POST", "/control/turno", local(), auth.as_deref(), &cuerpo).await;
+        assert_eq!((st, r.as_str()), (StatusCode::UNAUTHORIZED, r#"{"codigo":"TOKEN"}"#), "{auth:?}");
+    }
+    assert_eq!(b.salud_jugador().await["version"], Value::Null, "nada se guardó");
+}
+
+#[tokio::test(start_paused = true)]
+async fn turno_con_cuerpo_invalido_es_400_formato() {
+    let b = banco();
+    let tres = r#"{"version":1,"jugador":null,"vistas":["a","b","c"]}"#;
+    let vacio = r#"{"version":1,"jugador":{"sub":"","turnId":"t1"},"vistas":[]}"#;
+    for cuerpo in ["", "no es json", "[]", r#"{"version":1,"vistas":[]}"#, tres, vacio] {
+        let (st, r) = b.turno(cuerpo).await;
+        assert_eq!((st, r.as_str()), (StatusCode::BAD_REQUEST, r#"{"codigo":"FORMATO"}"#), "{cuerpo:?}");
+    }
+    assert_eq!(b.salud_jugador().await["version"], Value::Null);
+}
+
+#[tokio::test(start_paused = true)]
+async fn turno_version_menor_es_409_e_igual_es_idempotente() {
+    let b = banco();
+    b.empujar(5, Some(("u1", "t1"))).await;
+    b.empujar(5, Some(("u1", "t1"))).await;
+    let (st, r) = b.turno(&cuerpo_turno(4, None)).await;
+    assert_eq!((st, r.as_str()), (StatusCode::CONFLICT, r#"{"codigo":"VERSION"}"#));
+    let j = b.salud_jugador().await;
+    assert_eq!((j["version"].clone(), j["turnId"].clone()), (json!(5), json!("t1")), "el 409 no cambió nada");
+}
+
+#[tokio::test(start_paused = true)]
+async fn ctl_jugador_sin_su_turno_vigente_es_turno_sin_tocar_la_sesion() {
+    let b = banco();
+    let (mut ws, r) = b.ws_con(&token_jugador("u1", "t1")).await;
+    assert_eq!(r, json!({"t":"error","codigo":"TURNO"}));
+    assert!(cerrado(&mut ws).await);
+    assert!(b.mandos().is_empty(), "la sesión no recibió nada: {:?}", b.mandos());
+    b.empujar(1, Some(("u1", "t1"))).await;
+    // Otro turno de la misma cuenta, y la misma credencial con otra cuenta: tampoco.
+    let (_, r) = b.ws_con(&token_jugador("u1", "t0")).await;
+    assert_eq!(r, json!({"t":"error","codigo":"TURNO"}));
+    let (_, r) = b.ws_con(&token_jugador("u2", "t1")).await;
+    assert_eq!(r, json!({"t":"error","codigo":"TURNO"}));
+    assert!(b.mandos().is_empty());
+    let (_ws, r) = b.ws_con(&token_jugador("u1", "t1")).await;
+    assert_eq!(r, json!({"t":"ok","rol":"jugador"}));
+}
+
+#[tokio::test(start_paused = true)]
+async fn turno_que_termina_corta_al_jugador_antes_de_responder() {
+    let b = banco_con_turno().await;
+    let (mut ws, _) = b.ws_con(&token_jugador("u1", "t1")).await;
+    enviar(&mut ws, estado_json(CRUZ)).await;
+    sleep(Duration::from_millis(5)).await;
+    assert_eq!(b.ultimo_mando(), con(CRUZ));
+    let t = Instant::now();
+    b.empujar(2, None).await;
+    // Cuando llega el 200, la PS5 ya recibió el todo suelto.
+    assert_eq!(b.ultimo_mando(), EstadoMando::suelto());
+    assert_eq!(recibir(&mut ws).await, Some(json!({"t":"error","codigo":"TURNO"})));
+    assert!(t.elapsed() <= Duration::from_millis(50), "{:?}", t.elapsed());
+    assert!(cerrado(&mut ws).await);
+    let m = b.mandos();
+    let i = m.iter().rposition(|e| *e == con(CRUZ)).unwrap();
+    assert_eq!(&m[i + 1..], &[EstadoMando::suelto()], "suelto exactamente una vez: {m:?}");
+    // La ranura quedó libre: el jugador del turno siguiente entra.
+    b.empujar(3, Some(("u2", "t2"))).await;
+    let (_ws2, r) = b.ws_con(&token_jugador("u2", "t2")).await;
+    assert_eq!(r, json!({"t":"ok","rol":"jugador"}));
+}
+
+#[tokio::test(start_paused = true)]
+async fn turno_nuevo_de_otro_jugador_o_de_la_misma_cuenta_corta_al_anterior() {
+    for siguiente in [("u2", "t2"), ("u1", "t2")] {
+        let b = banco_con_turno().await;
+        let (mut ws, _) = b.ws_con(&token_jugador("u1", "t1")).await;
+        enviar(&mut ws, estado_json(CRUZ)).await;
+        sleep(Duration::from_millis(5)).await;
+        b.empujar(2, Some(siguiente)).await;
+        assert_eq!(b.ultimo_mando(), EstadoMando::suelto(), "{siguiente:?}");
+        assert_eq!(recibir(&mut ws).await, Some(json!({"t":"error","codigo":"TURNO"})), "{siguiente:?}");
+        assert!(cerrado(&mut ws).await);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn turno_con_el_mismo_jugador_y_otra_version_no_lo_corta() {
+    let b = banco_con_turno().await;
+    let (mut ws, _) = b.ws_con(&token_jugador("u1", "t1")).await;
+    enviar(&mut ws, estado_json(CRUZ)).await;
+    sleep(Duration::from_millis(5)).await;
+    let antes = b.mandos().len();
+    b.empujar(2, Some(("u1", "t1"))).await;
+    assert_eq!(b.mandos().len(), antes, "ni un suelto");
+    assert!(tokio::time::timeout(Duration::from_millis(100), recibir(&mut ws)).await.is_err(), "sin mensajes");
+    enviar(&mut ws, estado_json(L1)).await;
+    sleep(Duration::from_millis(5)).await;
+    assert_eq!(b.ultimo_mando(), con(L1), "sigue mandando");
+}
+
+#[tokio::test(start_paused = true)]
+async fn turno_no_toca_al_operador() {
+    let b = banco_con_turno().await;
+    let (mut ws, _) = b.ws_con(&token("operador")).await;
+    enviar(&mut ws, estado_json(PS)).await;
+    sleep(Duration::from_millis(5)).await;
+    b.empujar(2, None).await;
+    assert_eq!(b.ultimo_mando(), con(PS));
+    assert!(tokio::time::timeout(Duration::from_millis(100), recibir(&mut ws)).await.is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn ctl_una_vista_recibe_rol_y_no_suelta_al_jugador() {
+    let b = banco();
+    b.turno(&json!({"version":1,"jugador":{"sub":"u1","turnId":"t1"},"vistas":["u2"]}).to_string()).await;
+    let (mut ws, _) = b.ws_con(&token_jugador("u1", "t1")).await;
+    enviar(&mut ws, estado_json(CRUZ)).await;
+    sleep(Duration::from_millis(5)).await;
+    let antes = b.mandos();
+    for t in [token_vista("u2"), token_vista("u9")] {
+        let (mut wv, r) = b.ws_con(&t).await;
+        assert_eq!(r, json!({"t":"error","codigo":"ROL"}));
+        assert!(cerrado(&mut wv).await);
+    }
+    assert_eq!(b.mandos(), antes, "la sesión no recibió ningún suelto");
+    assert!(tokio::time::timeout(Duration::from_millis(100), recibir(&mut ws)).await.is_err(), "el jugador sigue");
+    enviar(&mut ws, estado_json(L1)).await;
+    sleep(Duration::from_millis(5)).await;
+    assert_eq!(b.ultimo_mando(), con(L1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn ctl_el_operador_reemplaza_al_jugador_y_le_dice_por_quien() {
+    let b = banco_con_turno().await;
+    let (mut wj, _) = b.ws_con(&token_jugador("u1", "t1")).await;
+    enviar(&mut wj, estado_json(CRUZ)).await;
+    sleep(Duration::from_millis(5)).await;
+    let (_wo, r) = b.ws_con(&token("operador")).await;
+    assert_eq!(r, json!({"t":"ok","rol":"operador"}));
+    assert_eq!(recibir(&mut wj).await, Some(json!({"t":"reemplazado","por":"operador"})));
+    assert!(cerrado(&mut wj).await);
+    assert_eq!(b.ultimo_mando(), EstadoMando::suelto());
+}
+
+#[tokio::test(start_paused = true)]
+async fn ctl_dos_jugadores_con_la_misma_credencial_el_segundo_reemplaza() {
+    let b = banco_con_turno().await;
+    let (mut w1, _) = b.ws_con(&token_jugador("u1", "t1")).await;
+    let (mut w2, r) = b.ws_con(&token_jugador("u1", "t1")).await;
+    assert_eq!(r, json!({"t":"ok","rol":"jugador"}));
+    assert_eq!(recibir(&mut w1).await, Some(json!({"t":"reemplazado","por":"jugador"})));
+    assert!(cerrado(&mut w1).await);
+    enviar(&mut w2, estado_json(CRUZ)).await;
+    sleep(Duration::from_millis(5)).await;
+    assert_eq!(b.ultimo_mando(), con(CRUZ));
+}
+
+// ---------------------------------------------------------------- salud del jugador
+
+fn r2_json() -> Value {
+    json!({"t":"estado","botones":0,"l2":0,"r2":255,"lx":0,"ly":0,"rx":0,"ry":0})
+}
+
+#[tokio::test(start_paused = true)]
+async fn salud_jugador_sin_empuje_es_todo_null() {
+    let b = banco();
+    assert_eq!(b.salud_jugador().await, json!({"version":null,"turnId":null,"mando":null,"inactivoMs":null}));
+}
+
+#[tokio::test(start_paused = true)]
+async fn salud_jugador_empujado_y_sin_nadie_cuenta_la_inactividad() {
+    let b = banco_con_turno().await;
+    sleep(Duration::from_secs(91)).await;
+    let j = b.salud_jugador().await;
+    assert_eq!((j["version"].clone(), j["turnId"].clone(), j["mando"].clone()), (json!(1), json!("t1"), Value::Null));
+    assert!(j["inactivoMs"].as_u64().unwrap() >= 90_000, "{j}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn salud_jugador_con_r2_mantenido_es_cero_y_al_soltar_vuelve_a_contar() {
+    let b = banco_con_turno().await;
+    let (mut ws, _) = b.ws_con(&token_jugador("u1", "t1")).await;
+    sleep(Duration::from_secs(10)).await;
+    enviar(&mut ws, r2_json()).await;
+    for _ in 0..10 {
+        sleep(Duration::from_millis(300)).await;
+        enviar(&mut ws, json!({"t":"latido"})).await;
+    }
+    sleep(Duration::from_millis(5)).await;
+    let j = b.salud_jugador().await;
+    assert_eq!((j["inactivoMs"].clone(), j["mando"].clone()), (json!(0), json!("jugador")), "{j}");
+    // 500 ms de silencio sueltan todo: desde ahí cuenta.
+    sleep(Duration::from_millis(1_500)).await;
+    let j = b.salud_jugador().await;
+    let ms = j["inactivoMs"].as_u64().unwrap();
+    assert!((1_000..=1_300).contains(&ms), "{j}");
+    // La deriva de un stick no es actividad.
+    enviar(&mut ws, json!({"t":"estado","botones":0,"l2":0,"r2":0,"lx":6000,"ly":0,"rx":0,"ry":0})).await;
+    sleep(Duration::from_millis(5)).await;
+    assert!(b.salud_jugador().await["inactivoMs"].as_u64().unwrap() >= 1_000);
+    // Vuelve a apretar y cierra la conexión con R2 apretado: cuenta desde el cierre.
+    enviar(&mut ws, r2_json()).await;
+    sleep(Duration::from_millis(5)).await;
+    assert_eq!(b.salud_jugador().await["inactivoMs"], json!(0));
+    ws.close(None).await.unwrap();
+    sleep(Duration::from_millis(5)).await;
+    sleep(Duration::from_secs(2)).await;
+    let j = b.salud_jugador().await;
+    let ms = j["inactivoMs"].as_u64().unwrap();
+    assert!((2_000..=2_100).contains(&ms), "{j}");
+    assert_eq!(j["mando"], Value::Null, "nadie en la ranura");
+}
+
+#[tokio::test(start_paused = true)]
+async fn salud_jugador_con_el_operador_dice_operador_y_su_mando_no_es_actividad() {
+    let b = banco_con_turno().await;
+    let (mut ws, _) = b.ws_con(&token("operador")).await;
+    sleep(Duration::from_secs(5)).await;
+    enviar(&mut ws, r2_json()).await;
+    sleep(Duration::from_millis(5)).await;
+    let j = b.salud_jugador().await;
+    assert_eq!(j["mando"], json!("operador"));
+    assert!(j["inactivoMs"].as_u64().unwrap() >= 5_000, "{j}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn salud_jugador_reemplazado_por_el_operador_deja_de_contar_como_activo() {
+    let b = banco_con_turno().await;
+    let (mut wj, _) = b.ws_con(&token_jugador("u1", "t1")).await;
+    enviar(&mut wj, r2_json()).await;
+    sleep(Duration::from_millis(5)).await;
+    assert_eq!(b.salud_jugador().await["inactivoMs"], json!(0));
+    let (mut wo, _) = b.ws_con(&token("operador")).await;
+    for _ in 0..10 {
+        sleep(Duration::from_millis(300)).await;
+        enviar(&mut wo, json!({"t":"latido"})).await;
+    }
+    let j = b.salud_jugador().await;
+    assert!(j["inactivoMs"].as_u64().unwrap() >= 2_900, "{j}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn tras_un_reinicio_el_jugador_recibe_turno_hasta_el_empuje_y_despues_ok() {
+    // Review Focus 5: miturno-rp arranca sin turno vigente (nada en disco).
+    let b = banco();
+    let t = token_jugador("u1", "t1");
+    let (_, r) = b.ws_con(&t).await;
+    assert_eq!(r, json!({"t":"error","codigo":"TURNO"}));
+    b.empujar(7, Some(("u1", "t1"))).await;
+    let j = b.salud_jugador().await;
+    assert_eq!((j["version"].clone(), j["turnId"].clone()), (json!(7), json!("t1")));
+    let (_ws, r) = b.ws_con(&t).await;
+    assert_eq!(r, json!({"t":"ok","rol":"jugador"}));
 }
