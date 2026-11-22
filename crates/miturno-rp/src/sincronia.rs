@@ -93,9 +93,24 @@ impl Sincronia {
         if ahora.saturating_sub(desde) < VENTANA_SINCRONIA {
             return None;
         }
+        self.cerrar_con(VENTANA_SINCRONIA.as_secs(), ahora)
+    }
+
+    /// Cierra ya la ventana en curso aunque no hayan pasado `VENTANA_SINCRONIA` (al volver el cartel):
+    /// devuelve el resumen parcial solo si hubo algo fuera de lo normal. Los segundos del texto se
+    /// redondean para arriba (como mínimo 1), así nunca dice menos de lo que cubre.
+    pub fn cerrar_ya(&mut self, ahora: Duration) -> Option<Resumen> {
+        let desde = self.desde?;
+        let segundos = ahora.saturating_sub(desde).as_millis().div_ceil(1_000).max(1) as u64;
+        self.cerrar_con(segundos, ahora)
+    }
+
+    /// Arma el resumen (si hubo algo fuera de lo normal) y empieza otra ventana en `ahora`.
+    fn cerrar_con(&mut self, segundos: u64, ahora: Duration) -> Option<Resumen> {
         let anormal =
             self.video.fuera_de_lo_normal() || self.audio.fuera_de_lo_normal() || self.av.abs() > DESFASE_NORMAL;
         let resumen = anormal.then(|| Resumen {
+            segundos,
             video: self.video.rango.unwrap_or_default(),
             audio: self.audio.rango,
             av: self.av,
@@ -114,6 +129,12 @@ impl Sincronia {
         *self = Self::default();
     }
 
+    /// Comienzo de la ventana actual (`None`: vacía).
+    #[cfg(test)]
+    pub fn desde(&self) -> Option<Duration> {
+        self.desde
+    }
+
     /// El desfase de audio más bajo de la ventana actual, en ticks.
     #[cfg(test)]
     pub fn audio_minimo(&self) -> Option<i64> {
@@ -123,6 +144,8 @@ impl Sincronia {
 
 /// Lo que dejó una ventana con algo fuera de lo normal (desfases en ticks de 90 kHz).
 pub struct Resumen {
+    /// Lo que cubre la ventana: `VENTANA_SINCRONIA` o, si se cerró antes, los segundos redondeados para arriba.
+    segundos: u64,
     video: (i64, i64),
     /// `None`: no salió audio en la ventana.
     audio: Option<(i64, i64)>,
@@ -143,9 +166,8 @@ fn ms_de(d: Duration) -> u128 {
 
 impl fmt::Display for Resumen {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let segundos = VENTANA_SINCRONIA.as_secs();
         let (vmin, vmax) = self.video;
-        write!(f, "salida: últimos {segundos} s: video {}..{} ms del reloj, ", ms(vmin), ms(vmax))?;
+        write!(f, "salida: últimos {} s: video {}..{} ms del reloj, ", self.segundos, ms(vmin), ms(vmax))?;
         match self.audio {
             Some((amin, amax)) => write!(f, "audio {}..{} ms", ms(amin), ms(amax))?,
             None => write!(f, "audio sin paquetes")?,
@@ -305,6 +327,35 @@ mod tests {
         s.video(0, us(10_300_000));
         let r = s.cerrar(us(20_300_000)).expect("hueco de 10,3 s");
         assert!(r.to_string().contains("hueco máximo de video 10300 ms"), "{r}");
+    }
+
+    #[test]
+    fn cerrar_ya_da_el_parcial_con_los_segundos_reales() {
+        let mut s = Sincronia::new();
+        s.video(0, us(1_000_000));
+        s.audio(t(-300), us(1_000_000));
+        s.video(0, us(4_400_000));
+        let r = s.cerrar_ya(us(4_400_000)).expect("audio a −300 ms");
+        // 3,4 s de ventana: se redondea para arriba, así el texto nunca dice menos de lo que cubre.
+        assert_eq!(
+            r.to_string(),
+            "salida: últimos 4 s: video 0..0 ms del reloj, audio -300..-300 ms, A/V hasta 300 ms, \
+             hueco máximo de video 3400 ms, de audio 0 ms"
+        );
+        assert_eq!(s.desde(), Some(us(4_400_000)), "empieza otra ventana");
+        assert_eq!(s.audio_minimo(), None);
+        // Una ventana parcial cortita dice 1 s, no 0.
+        s.video(t(80), us(4_500_000));
+        let r = s.cerrar_ya(us(4_600_000)).expect("video a 80 ms").to_string();
+        assert!(r.starts_with("salida: últimos 1 s: video 80..80 ms"), "{r}");
+    }
+
+    #[test]
+    fn cerrar_ya_sin_nada_raro_o_sin_datos_no_da_resumen() {
+        let mut s = Sincronia::new();
+        assert!(s.cerrar_ya(us(1_000_000)).is_none(), "sin datos");
+        assert!(simular(&mut s, 0, 5_000_000, vaiven, vaiven, None).is_empty());
+        assert!(s.cerrar_ya(us(5_000_000)).is_none(), "en régimen");
     }
 
     #[test]
