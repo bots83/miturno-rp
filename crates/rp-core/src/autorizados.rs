@@ -73,9 +73,15 @@ impl Autorizados {
 
     /// ¿Puede esta credencial mandar al mando? Códigos: `TURNO` (no es el turno vigente) y `ROL`.
     pub fn mandos(&self, c: &Credencial) -> Result<(), &'static str> {
-        match c.rol {
+        self.mandos_de(c.rol, &c.sub, c.turn_id.as_deref())
+    }
+
+    /// La regla de `mandos` con lo único que mira de la credencial: rol, `sub` y `turnId` (así la usa
+    /// también quien ya no tiene la credencial, como el que controla al llegar un turno nuevo).
+    pub fn mandos_de(&self, rol: Rol, sub: &str, turn_id: Option<&str>) -> Result<(), &'static str> {
+        match rol {
             Rol::Operador => Ok(()),
-            Rol::Jugador if self.es_vigente(&c.sub, c.turn_id.as_deref()) => Ok(()),
+            Rol::Jugador if self.es_vigente(sub, turn_id) => Ok(()),
             Rol::Jugador => Err("TURNO"),
             Rol::Vista => Err("ROL"),
         }
@@ -188,6 +194,24 @@ mod tests {
         assert_eq!(v.mandos(&cred(Rol::Jugador, "u2", Some("t1"))), Err("TURNO"));
         assert_eq!(Autorizados::vacio().mandos(&cred(Rol::Jugador, "u1", Some("t1"))), Err("TURNO"));
         assert_eq!(v.mandos(&cred(Rol::Vista, "u1", None)), Err("ROL"));
+    }
+
+    #[test]
+    fn mandos_de_es_la_misma_regla_que_mandos_sin_armar_una_credencial() {
+        let v = vigente("u1", "t1", &["u2"]);
+        assert_eq!(v.mandos_de(Rol::Operador, "op", None), Ok(()));
+        assert_eq!(Autorizados::vacio().mandos_de(Rol::Operador, "op", None), Ok(()));
+        assert_eq!(v.mandos_de(Rol::Jugador, "u1", Some("t1")), Ok(()));
+        assert_eq!(v.mandos_de(Rol::Jugador, "u1", Some("t0")), Err("TURNO"));
+        assert_eq!(v.mandos_de(Rol::Jugador, "u1", None), Err("TURNO"));
+        assert_eq!(v.mandos_de(Rol::Jugador, "u2", Some("t1")), Err("TURNO"));
+        assert_eq!(v.mandos_de(Rol::Vista, "u2", None), Err("ROL"), "una vista nunca manda");
+        assert_eq!(v.mandos_de(Rol::Vista, "u1", Some("t1")), Err("ROL"));
+        for (rol, sub, turno) in
+            [(Rol::Jugador, "u1", Some("t1")), (Rol::Jugador, "u1", Some("t0")), (Rol::Vista, "u1", None)]
+        {
+            assert_eq!(v.mandos(&cred(rol, sub, turno)), v.mandos_de(rol, sub, turno), "{rol:?} {sub} {turno:?}");
+        }
     }
 
     #[test]
