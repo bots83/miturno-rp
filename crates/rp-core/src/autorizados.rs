@@ -27,6 +27,14 @@ pub struct Autorizados {
     #[serde(deserialize_with = "Option::deserialize")]
     pub jugador: Option<JugadorVigente>,
     pub vistas: Vec<String>,
+    /// `false` con la fila en pausa: el jugador vigente no manda (`PAUSA`) pero sigue viendo. La api
+    /// manda la clave solo cuando es `false`; sin ella hay mandos (`true` explícito también vale).
+    #[serde(default = "con_mandos")]
+    pub mandos: bool,
+}
+
+fn con_mandos() -> bool {
+    true
 }
 
 /// Motivo por el que se rechaza el JSON de autorizados.
@@ -41,7 +49,8 @@ fn campo_valido(s: &str) -> bool {
     !s.is_empty() && s.len() <= MAX_SUB
 }
 
-/// Lee y valida el JSON exacto `{"version":n,"jugador":{"sub":..,"turnId":..}|null,"vistas":[..]}`.
+/// Lee y valida el JSON exacto `{"version":n,"jugador":{"sub":..,"turnId":..}|null,"vistas":[..]}`,
+/// con `"mandos":false|true` opcional.
 pub fn leer_autorizados(json: &str) -> Result<Autorizados, ErrorAutorizados> {
     let a: Autorizados = serde_json::from_str(json).map_err(|_| ErrorAutorizados::Formato)?;
     if a.vistas.len() > MAX_VISTAS {
@@ -61,7 +70,7 @@ pub fn leer_autorizados(json: &str) -> Result<Autorizados, ErrorAutorizados> {
 impl Autorizados {
     /// Sin nadie autorizado (versión 0).
     pub fn vacio() -> Self {
-        Self { version: 0, jugador: None, vistas: Vec::new() }
+        Self { version: 0, jugador: None, vistas: Vec::new(), mandos: true }
     }
 
     fn es_vigente(&self, sub: &str, turn_id: Option<&str>) -> bool {
@@ -71,7 +80,8 @@ impl Autorizados {
         }
     }
 
-    /// ¿Puede esta credencial mandar al mando? Códigos: `TURNO` (no es el turno vigente) y `ROL`.
+    /// ¿Puede esta credencial mandar al mando? Códigos: `TURNO` (no es el turno vigente), `PAUSA` (es
+    /// el turno vigente pero la fila está en pausa: `mandos == false`) y `ROL`.
     pub fn mandos(&self, c: &Credencial) -> Result<(), &'static str> {
         self.mandos_de(c.rol, &c.sub, c.turn_id.as_deref())
     }
@@ -81,13 +91,15 @@ impl Autorizados {
     pub fn mandos_de(&self, rol: Rol, sub: &str, turn_id: Option<&str>) -> Result<(), &'static str> {
         match rol {
             Rol::Operador => Ok(()),
+            Rol::Jugador if self.es_vigente(sub, turn_id) && !self.mandos => Err("PAUSA"),
             Rol::Jugador if self.es_vigente(sub, turn_id) => Ok(()),
             Rol::Jugador => Err("TURNO"),
             Rol::Vista => Err("ROL"),
         }
     }
 
-    /// ¿Puede recibir video? La vista que pasó a jugar (misma cuenta) no lo pierde.
+    /// ¿Puede recibir video? La vista que pasó a jugar (misma cuenta) no lo pierde. No mira `mandos`:
+    /// en pausa el jugador sigue viendo.
     pub fn video(&self, rol: Rol, sub: &str, turn_id: Option<&str>) -> bool {
         rol == Rol::Operador
             || self.es_vigente(sub, turn_id)
@@ -108,19 +120,72 @@ mod tests {
             version: 1,
             jugador: Some(JugadorVigente { sub: sub.into(), turn_id: turn.into() }),
             vistas: vistas.iter().map(|s| s.to_string()).collect(),
+            mandos: true,
         }
+    }
+    /// El mismo turno vigente con la fila en pausa (`"mandos":false`).
+    fn pausado(sub: &str, turn: &str, vistas: &[&str]) -> Autorizados {
+        Autorizados { mandos: false, ..vigente(sub, turn, vistas) }
     }
 
     #[test]
     fn lee_el_json_con_jugador_nulo_y_sin_vistas() {
         let a = leer_autorizados(r#"{"version":7,"jugador":null,"vistas":[]}"#).unwrap();
-        assert_eq!(a, Autorizados { version: 7, jugador: None, vistas: vec![] });
+        assert_eq!(a, Autorizados { version: 7, jugador: None, vistas: vec![], mandos: true });
     }
 
     #[test]
     fn lee_jugador_y_vistas() {
         let a = leer_autorizados(r#"{"version":1,"jugador":{"sub":"u1","turnId":"t1"},"vistas":["u2","u3"]}"#).unwrap();
         assert_eq!(a, vigente("u1", "t1", &["u2", "u3"]));
+    }
+
+    #[test]
+    fn lee_mandos_opcional_y_sin_la_clave_hay_mandos() {
+        let base = r#""version":1,"jugador":{"sub":"u1","turnId":"t1"},"vistas":["u2"]"#;
+        let leer = |extra: &str| leer_autorizados(&format!("{{{base}{extra}}}"));
+        assert_eq!(leer("").unwrap(), vigente("u1", "t1", &["u2"]), "sin la clave (lo de siempre): con mandos");
+        assert_eq!(leer(r#","mandos":true"#).unwrap(), vigente("u1", "t1", &["u2"]));
+        assert_eq!(leer(r#","mandos":false"#).unwrap(), pausado("u1", "t1", &["u2"]));
+        let sin_jugador = leer_autorizados(r#"{"version":2,"jugador":null,"vistas":[],"mandos":false}"#).unwrap();
+        assert!(!sin_jugador.mandos);
+        for malo in [r#","mandos":null"#, r#","mandos":0"#, r#","mandos":"false""#, r#","mandos":false,"pausa":true"#] {
+            assert_eq!(leer(malo).err(), Some(ErrorAutorizados::Formato), "{malo:?}");
+        }
+    }
+
+    #[test]
+    fn sin_mandos_el_jugador_vigente_recibe_pausa_y_el_resto_sigue_igual() {
+        let p = pausado("u1", "t1", &["u2"]);
+        assert_eq!(p.mandos_de(Rol::Jugador, "u1", Some("t1")), Err("PAUSA"));
+        assert_eq!(p.mandos(&cred(Rol::Jugador, "u1", Some("t1"))), Err("PAUSA"));
+        assert_eq!(p.mandos_de(Rol::Jugador, "u1", Some("t0")), Err("TURNO"), "otro turno de la misma cuenta");
+        assert_eq!(p.mandos_de(Rol::Jugador, "u1", None), Err("TURNO"));
+        assert_eq!(p.mandos_de(Rol::Jugador, "u2", Some("t1")), Err("TURNO"), "otro jugador");
+        assert_eq!(p.mandos_de(Rol::Operador, "op", None), Ok(()), "el operador nunca pierde los mandos");
+        assert_eq!(p.mandos_de(Rol::Vista, "u2", None), Err("ROL"));
+        assert_eq!(p.mandos_de(Rol::Vista, "u1", Some("t1")), Err("ROL"));
+        let sin_jugador = Autorizados { mandos: false, ..Autorizados::vacio() };
+        assert_eq!(sin_jugador.mandos_de(Rol::Jugador, "u1", Some("t1")), Err("TURNO"));
+        assert_eq!(sin_jugador.mandos_de(Rol::Operador, "op", None), Ok(()));
+    }
+
+    #[test]
+    fn sin_mandos_el_video_no_cambia() {
+        let (con, sin) = (vigente("u1", "t1", &["u2"]), pausado("u1", "t1", &["u2"]));
+        for (rol, sub, turno) in [
+            (Rol::Operador, "op", None),
+            (Rol::Jugador, "u1", Some("t1")),
+            (Rol::Jugador, "u1", Some("t0")),
+            (Rol::Jugador, "u1", None),
+            (Rol::Jugador, "u9", Some("t1")),
+            (Rol::Vista, "u2", None),
+            (Rol::Vista, "u1", None),
+            (Rol::Vista, "u9", None),
+        ] {
+            assert_eq!(sin.video(rol, sub, turno), con.video(rol, sub, turno), "{rol:?} {sub} {turno:?}");
+        }
+        assert!(sin.video(Rol::Jugador, "u1", Some("t1")), "el jugador en pausa sigue viendo");
     }
 
     #[test]
@@ -217,7 +282,7 @@ mod tests {
     #[test]
     fn video_segun_rol_vistas_y_cuenta() {
         assert!(Autorizados::vacio().video(Rol::Operador, "op", None));
-        let con = Autorizados { version: 1, jugador: None, vistas: vec!["u3".into()] };
+        let con = Autorizados { version: 1, jugador: None, vistas: vec!["u3".into()], mandos: true };
         assert!(con.video(Rol::Vista, "u3", None));
         assert!(!Autorizados::vacio().video(Rol::Vista, "u3", None));
         let v = vigente("u1", "t1", &[]);

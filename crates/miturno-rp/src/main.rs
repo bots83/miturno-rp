@@ -89,6 +89,7 @@ fn correr(rutas: Rutas) -> Result<(), String> {
             sistema: Arc::new(SistemaReal),
             reloj_s: servidor::reloj_sistema_s,
             sesiones_whep: Some(config.sesiones_whep.clone()),
+            vigia_estado: config.vigia_estado.clone(),
         });
         tokio::spawn(servidor::muestrear_cpu(estado.clone()));
         // Sin Nagle: los mandos salen enseguida.

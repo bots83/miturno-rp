@@ -7,8 +7,9 @@
 //!   una sesión abierta. Una cuenta (salvo el operador) tiene una sola sesión.
 //! - `GET /control/salud` y `POST /control/{reconectar,kick_on,kick_off,reposo,encender,turno}`: solo con
 //!   el token de control de la api (nunca con la credencial del navegador). `turno` recibe el turno
-//!   vigente y las vistas (`leer_autorizados`); al arrancar no hay ninguno (nada en disco). Después de
-//!   responder, expulsa en segundo plano las sesiones WHEP que ya no tienen video.
+//!   vigente, las vistas y si hay mandos (`leer_autorizados`; `"mandos":false` con la fila en pausa); al
+//!   arrancar no hay ninguno (nada en disco). Después de responder, expulsa en segundo plano las
+//!   sesiones WHEP que ya no tienen video.
 //!
 //! Nunca se registran credenciales, tokens ni el nombre de la conexión de casa.
 
@@ -112,6 +113,8 @@ pub struct Piezas<S: SesionPs5> {
     /// Dónde se guarda el registro de sesiones WHEP (`sesiones_whep` de `rp.toml`). Sin ruta, vive solo
     /// en memoria (tests).
     pub sesiones_whep: Option<PathBuf>,
+    /// `estado.json` del vigilante de imagen (`vigia_estado` de `rp.toml`). Sin ruta, la salud manda `vigia: null`.
+    pub vigia_estado: Option<PathBuf>,
 }
 
 pub struct EstadoServidor<S: SesionPs5> {
@@ -122,6 +125,7 @@ pub struct EstadoServidor<S: SesionPs5> {
     metricas: Arc<Metricas>,
     sistema: Arc<dyn Sistema>,
     reloj_s: fn() -> u64,
+    vigia_estado: Option<PathBuf>,
     /// Origen del reloj monótono (en milisegundos) del filtro y del guardián.
     t0: Instant,
     /// El único controlador que puede mandar a la PS5, el turno vigente y la actividad del jugador.
@@ -165,6 +169,7 @@ impl<S: SesionPs5> EstadoServidor<S> {
                 metricas: p.metricas,
                 sistema: p.sistema,
                 reloj_s: p.reloj_s,
+                vigia_estado: p.vigia_estado,
                 t0: Instant::now(),
                 ranura: Mutex::new(ctl::Ranura::new(whep)),
                 cola_whep,
@@ -470,9 +475,10 @@ async fn kick<S: SesionPs5>(e: &EstadoServidor<S>, verbo: &str) -> Response {
 }
 
 /// `POST /control/turno`: el turno vigente y las vistas que publica la api. `200` recién después de
-/// cortar al jugador que ya no corresponde; `409 VERSION` si la versión es menor que la guardada;
-/// `400 FORMATO` si el cuerpo no es el JSON exacto. Las sesiones WHEP que se quedaron sin video se
-/// expulsan en segundo plano (la respuesta no espera a la API de MediaMTX).
+/// cortar al jugador que ya no corresponde (o que se quedó sin mandos por la pausa); `409 VERSION` si
+/// la versión es menor que la guardada; `400 FORMATO` si el cuerpo no es el JSON exacto. Las sesiones
+/// WHEP que se quedaron sin video se expulsan en segundo plano (la respuesta no espera a la API de
+/// MediaMTX).
 async fn turno<S: SesionPs5>(State(e): State<Compartido<S>>, cuerpo: Bytes) -> Response {
     let Some(a) = std::str::from_utf8(&cuerpo).ok().and_then(|t| leer_autorizados(t).ok()) else {
         static LIM: crate::registro::Limitado = crate::registro::Limitado::new();
@@ -482,6 +488,7 @@ async fn turno<S: SesionPs5>(State(e): State<Compartido<S>>, cuerpo: Bytes) -> R
     let version = a.version;
     let turno = a.jugador.as_ref().map(|j| j.turn_id.clone());
     let vistas = a.vistas.len();
+    let pausa = if a.mandos { "" } else { ", sin mandos (pausa)" };
     match e.aplicar_turno(a) {
         Err(ctl::VersionVieja(guardada)) => {
             crate::info!("control/turno: versión {version} menor que la guardada ({guardada}); rechazada");
@@ -490,10 +497,14 @@ async fn turno<S: SesionPs5>(State(e): State<Compartido<S>>, cuerpo: Bytes) -> R
         Ok(hecho) => {
             if hecho.anterior != version {
                 let turno = turno.as_deref().unwrap_or("ninguno");
-                crate::info!("control/turno: v{version}, turno {turno}, {vistas} vistas");
+                crate::info!("control/turno: v{version}, turno {turno}, {vistas} vistas{pausa}");
             }
-            if let Some(id) = hecho.cortada {
-                crate::info!("control/turno: la conexión {id} ya no tiene turno; mandos cortados");
+            match hecho.cortada {
+                Some((id, ctl::Expulsion::Pausa)) => {
+                    crate::info!("control/turno: la conexión {id} queda sin mandos por la pausa; mandos cortados")
+                }
+                Some((id, _)) => crate::info!("control/turno: la conexión {id} ya no tiene turno; mandos cortados"),
+                None => {}
             }
             e.expulsar_whep(hecho.expulsar, "ya no tiene video");
             ok()
@@ -539,12 +550,28 @@ struct VideoSalud {
     turn: bool,
     cpu: f64,
     jugador: SaludJugador,
+    /// Siempre presente: `null` sin ruta configurada o con un archivo que no cierra.
+    vigia: Option<crate::vigia::SaludVigia>,
 }
 
 async fn salud<S: SesionPs5>(State(e): State<Compartido<S>>) -> Json<VideoSalud> {
     let unidades = [UNIDAD_KICK, UNIDAD_MEDIAMTX, UNIDAD_TURN];
     let estados = e.sistema.estados(&unidades).await;
     let activo = |i: usize| estados.get(i).map(String::as_str).unwrap_or("desconocido");
+    let vigia = match e.vigia_estado.clone() {
+        Some(ruta) => {
+            let ahora_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64);
+            // La salud no puede trabarse: si la lectura tarda (montaje colgado), se da `null`.
+            let lectura = tokio::task::spawn_blocking(move || crate::vigia::leer_vigia(&ruta, ahora_ms));
+            match tokio::time::timeout(std::time::Duration::from_millis(500), lectura).await {
+                Ok(r) => r.ok().flatten(),
+                Err(_) => None,
+            }
+        }
+        None => None,
+    };
     Json(VideoSalud {
         sesion: e.metricas.foto(Instant::now()),
         kick: estado_kick(activo(0)),
@@ -552,5 +579,6 @@ async fn salud<S: SesionPs5>(State(e): State<Compartido<S>>) -> Json<VideoSalud>
         turn: activo(2) == "active",
         cpu: *e.cpu.lock().unwrap_or_else(|e| e.into_inner()),
         jugador: e.salud_jugador(),
+        vigia,
     })
 }

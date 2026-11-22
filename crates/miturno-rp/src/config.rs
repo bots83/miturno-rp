@@ -49,6 +49,9 @@ pub struct Config {
     /// expulsar a quien ya no corresponde. Por defecto, `RUTA_SESIONES_WHEP`.
     #[serde(default = "ruta_sesiones_whep")]
     pub sesiones_whep: PathBuf,
+    /// `estado.json` del vigilante de imagen (`miturno-vigia`), para la salud. Sin él, `vigia` es `null`.
+    #[serde(default)]
+    pub vigia_estado: Option<PathBuf>,
 }
 
 /// Todo lo que hace falta para despertar la PS5 y abrir una sesión.
@@ -297,7 +300,18 @@ pausa = "/var/lib/miturno-rp/pausa"
                 token_control: r("/etc/miturno-video/control.token"),
                 pausa: r("/var/lib/miturno-rp/pausa"),
                 sesiones_whep: r(RUTA_SESIONES_WHEP),
+                vigia_estado: None,
             }
+        );
+    }
+
+    #[test]
+    fn vigia_estado_es_opcional() {
+        assert_eq!(parsear_config(TOML, &r("rp.toml")).unwrap().vigia_estado, None);
+        let con = format!("{TOML}vigia_estado = \"/run/miturno-vigia-estado/estado.json\"\n");
+        assert_eq!(
+            parsear_config(&con, &r("rp.toml")).unwrap().vigia_estado,
+            Some(r("/run/miturno-vigia-estado/estado.json"))
         );
     }
 
@@ -322,7 +336,9 @@ pausa = "/var/lib/miturno-rp/pausa"
     #[test]
     fn la_plantilla_del_repo_es_valida() {
         let t = include_str!("../../../config/rp.toml");
-        assert_eq!(parsear_config(t, &r("config/rp.toml")).unwrap(), parsear_config(TOML, &r("rp.toml")).unwrap());
+        let mut esperada = parsear_config(TOML, &r("rp.toml")).unwrap();
+        esperada.vigia_estado = Some(r("/run/miturno-vigia-estado/estado.json"));
+        assert_eq!(parsear_config(t, &r("config/rp.toml")).unwrap(), esperada);
     }
 
     #[test]

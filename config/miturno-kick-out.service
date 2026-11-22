@@ -33,10 +33,25 @@
 # 59,94: el filtro fps duplica un cuadro cada ~17 s), x264 veryfast, tune zerolatency, sin B-frames,
 # 4500 kbps CBR, keyframe cada 120 cuadros (2 s) sin cortes de escena, AAC 160 kbps 48 kHz estéreo.
 #
-# Reserva para F2 (vigilante de imagen, spec §5.4): el video se decodifica una sola vez y se reparte
-# con split. Para sumar los cuadros chicos se cambia "split=1[k]" por "split=2[k][v]", se agrega
-# ";[v]fps=1,scale=160:90[vigia]" al grafo de -filter_complex y una salida más al final del comando,
-# por ejemplo: -map "[vigia]" -an -c:v rawvideo -pix_fmt gray -f rawvideo <destino del vigilante>.
+# Cuadros para el vigilante de imagen (miturno-vigia): el video se decodifica una sola vez y split lo
+# reparte. La rama de Kick es la de siempre; la otra saca 1 cuadro de cada 60 (~1 por segundo), a
+# 960×540 en RGB, a /run/miturno-vigia/cuadro.ppm (tmpfs), que el clasificador lee cuando quiere.
+# - framestep=60 y no fps=1: framestep cuenta cuadros y fps=1 sigue las marcas de tiempo (ante un
+#   salto de marcas duplica o descarta cuadros). Además no lleva comas ni barras que escapar acá.
+# - -fps_mode passthrough: la salida vigía no duplica ni descarta cuadros por su cuenta.
+# - image2 con update=1 y atomic_writing=1: pisa siempre el mismo archivo, escribiendo a
+#   cuadro.ppm.tmp y renombrando, así nunca se lee un cuadro a medio escribir.
+# - tee con onfail=ignore: si no se puede abrir el cuadro (carpeta borrada), se cae solo esa salida y
+#   Kick sigue. Con el tmpfs lleno, image2 de 6.1 probablemente no falla: puede renombrar un
+#   cuadro.ppm truncado, que el lector descarta por tamaño (no mide 15 + 960·540·3 bytes).
+#   El esclavo [f=null]- (no escribe nada y nunca falla) es necesario:
+#   con un solo esclavo, ffmpeg 6.1.1 ignora onfail ("All tee outputs failed."), la falla llega al
+#   muxer ("Error muxing a packet") y ffmpeg termina con 251 en vez de 0 (Kick sigue hasta el final,
+#   pero el error queda guardado). Con el null, sale con 0 al terminar la entrada y con 255 ante SIGTERM.
+# - Una salida de cuadros que falló queda muerta hasta el próximo arranque de kick-out, aunque la
+#   carpeta vuelva. El vigilante lo ve como sin cuadros y, en modo activo con un turno, pausa por
+#   servidor a los 15 s. Con kick-out apagado tampoco hay cuadros.
+# - La carpeta es 0755 y el cuadro 0644 a propósito: es la misma imagen que sale por Kick.
 [Unit]
 Description=MiTurno: salida a Kick (ffmpeg 720p60 por RTMPS)
 # After=miturno-rp: en un apagado o un deploy, systemd para primero kick-out (el orden de parada es
@@ -52,6 +67,9 @@ Type=simple
 DynamicUser=yes
 EnvironmentFile=-/etc/miturno-video/kick.env
 SyslogIdentifier=miturno-kick-out
+# /run/miturno-vigia: la carpeta de los cuadros del vigilante (tmpfs, se borra al parar).
+RuntimeDirectory=miturno-vigia
+RuntimeDirectoryMode=0755
 # $$ es un $ para bash (systemd no reemplaza nada: la clave nunca pasa por la línea de esta unidad).
 ExecStart=/bin/bash -c '\
   set -u; \
@@ -63,13 +81,14 @@ ExecStart=/bin/bash -c '\
   unset KICK_STREAM_KEY KICK_RTMP_URL KICK_DESTINO; \
   exec /usr/bin/ffmpeg -hide_banner -nostdin -nostats -loglevel warning \
     -rtsp_transport tcp -timeout 5000000 -i rtsp://127.0.0.1:8554/ps5 \
-    -filter_complex "[0:v:0]split=1[k];[k]scale=1280:720,fps=60,format=yuv420p[kick]" \
+    -filter_complex "[0:v:0]split=2[k][v];[k]scale=1280:720,fps=60,format=yuv420p[kick];[v]framestep=60,scale=960:540,format=rgb24[vigia]" \
     -map "[kick]" -map 0:a:0 \
     -c:v libx264 -preset veryfast -tune zerolatency -profile:v high -bf 0 \
     -b:v 4500k -maxrate 4500k -bufsize 4500k -g 120 -keyint_min 120 -sc_threshold 0 \
     -x264-params nal-hrd=cbr:keyint=120:min-keyint=120:scenecut=0 \
     -c:a aac -b:a 160k -ar 48000 -ac 2 \
     -f flv -flvflags no_duration_filesize "$$destino" \
+    -map "[vigia]" -an -fps_mode passthrough -c:v ppm -f tee "[f=image2:update=1:atomic_writing=1:onfail=ignore]/run/miturno-vigia/cuadro.ppm|[f=null]-" \
     2> >(exec /usr/bin/sed -E -u -e "s#rtmps?://[^[:space:]]*#<destino oculto>#g" -e "s#sk_[A-Za-z0-9_-]+#<clave oculta>#g" >&2)'
 # ffmpeg sale con 255 cuando lo paran con SIGTERM (kick_off): es un apagado normal, no una falla.
 SuccessExitStatus=255
