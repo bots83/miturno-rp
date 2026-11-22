@@ -117,6 +117,24 @@ mod tests {
     }
 
     #[test]
+    fn soltar_de_otro_turno_se_ignora() {
+        let mut a = Actividad::new();
+        a.turno(Some("t1"), 0);
+        a.registrar("t1", &EstadoMando { botones: CRUZ, ..Default::default() }, 1000);
+        a.soltar("t0", 5000);
+        assert_eq!(a.inactivo_ms(9000), Some(0), "sigue sostenido: soltar de otro turno no cuenta");
+        a.soltar("t1", 9000);
+        assert_eq!(a.inactivo_ms(10_000), Some(1000));
+        // Soltar dos veces no corre el inicio de la cuenta.
+        a.soltar("t1", 9500);
+        assert_eq!(a.inactivo_ms(10_000), Some(1000));
+        // Sin turno, soltar no hace nada.
+        let mut b = Actividad::new();
+        b.soltar("t1", 10);
+        assert_eq!(b.inactivo_ms(20), None);
+    }
+
+    #[test]
     fn otro_turno_se_ignora_y_el_mismo_no_reinicia() {
         let mut a = Actividad::new();
         a.turno(Some("t1"), 1000);

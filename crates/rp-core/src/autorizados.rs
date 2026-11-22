@@ -22,6 +22,9 @@ pub struct JugadorVigente {
 #[serde(deny_unknown_fields)]
 pub struct Autorizados {
     pub version: u64,
+    /// La clave es obligatoria (`null` cuando no hay jugador): con `deserialize_with`, serde deja de
+    /// tomar un `Option` ausente como `None`.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub jugador: Option<JugadorVigente>,
     pub vistas: Vec<String>,
 }
@@ -116,19 +119,64 @@ mod tests {
 
     #[test]
     fn rechaza_tres_vistas_campos_extra_y_vacios_o_largos() {
-        assert!(leer_autorizados(r#"{"version":1,"jugador":null,"vistas":["a","b","c"]}"#).is_err());
-        assert!(leer_autorizados(r#"{"version":1,"jugador":null,"vistas":[],"extra":1}"#).is_err());
-        assert!(leer_autorizados(r#"{"version":1,"jugador":{"sub":"","turnId":"t"},"vistas":[]}"#).is_err());
-        assert!(leer_autorizados(r#"{"version":1,"jugador":{"sub":"u","turnId":""},"vistas":[]}"#).is_err());
+        use ErrorAutorizados::{Campo, Formato, Vistas};
+        let err = |j: &str| leer_autorizados(j).err();
+        assert_eq!(err(r#"{"version":1,"jugador":null,"vistas":["a","b","c"]}"#), Some(Vistas));
+        assert_eq!(err(r#"{"version":1,"jugador":null,"vistas":[],"extra":1}"#), Some(Formato));
+        assert_eq!(err(r#"{"version":1,"jugador":{"sub":"","turnId":"t"},"vistas":[]}"#), Some(Campo));
+        assert_eq!(err(r#"{"version":1,"jugador":{"sub":"u","turnId":""},"vistas":[]}"#), Some(Campo));
         let largo = "x".repeat(65);
         let j = format!(r#"{{"version":1,"jugador":{{"sub":"{largo}","turnId":"t"}},"vistas":[]}}"#);
-        assert!(leer_autorizados(&j).is_err());
+        assert_eq!(err(&j), Some(Campo));
+        let j = format!(r#"{{"version":1,"jugador":{{"sub":"u","turnId":"{largo}"}},"vistas":[]}}"#);
+        assert_eq!(err(&j), Some(Campo));
         let v = format!(r#"{{"version":1,"jugador":null,"vistas":["{largo}"]}}"#);
-        assert!(leer_autorizados(&v).is_err());
+        assert_eq!(err(&v), Some(Campo));
         let justo = "x".repeat(64);
-        let ok = format!(r#"{{"version":1,"jugador":{{"sub":"{justo}","turnId":"t"}},"vistas":[]}}"#);
+        let ok = format!(r#"{{"version":1,"jugador":{{"sub":"{justo}","turnId":"{justo}"}},"vistas":["{justo}"]}}"#);
         assert!(leer_autorizados(&ok).is_ok());
-        assert!(leer_autorizados(r#"{"version":1,"jugador":{"sub":"u","turnId":"t","x":1},"vistas":[]}"#).is_err());
+        assert_eq!(err(r#"{"version":1,"jugador":{"sub":"u","turnId":"t","x":1},"vistas":[]}"#), Some(Formato));
+    }
+
+    #[test]
+    fn la_clave_jugador_es_obligatoria_aunque_sea_null() {
+        assert_eq!(leer_autorizados(r#"{"version":1,"vistas":[]}"#).err(), Some(ErrorAutorizados::Formato));
+        assert!(leer_autorizados(r#"{"version":1,"jugador":null,"vistas":[]}"#).is_ok());
+    }
+
+    #[test]
+    fn rechaza_json_invalido_y_claves_faltantes_o_de_otro_tipo() {
+        use ErrorAutorizados::{Campo, Formato};
+        let err = |j: &str| leer_autorizados(j).err();
+        for j in [
+            "",
+            "no es json",
+            "[]",
+            "null",
+            r#"{"jugador":null,"vistas":[]}"#,
+            r#"{"version":1,"jugador":null}"#,
+            r#"{"version":-1,"jugador":null,"vistas":[]}"#,
+            r#"{"version":"1","jugador":null,"vistas":[]}"#,
+            r#"{"version":1,"jugador":{"sub":"u"},"vistas":[]}"#,
+            r#"{"version":1,"jugador":{"sub":"u","turnId":null},"vistas":[]}"#,
+            r#"{"version":1,"jugador":{"turnId":"t"},"vistas":[]}"#,
+            r#"{"version":1,"jugador":"u1","vistas":[]}"#,
+            r#"{"version":1,"jugador":null,"vistas":[1]}"#,
+        ] {
+            assert_eq!(err(j), Some(Formato), "{j:?}");
+        }
+        assert_eq!(err(r#"{"version":1,"jugador":null,"vistas":[""]}"#), Some(Campo), "vista con sub vacío");
+        assert_eq!(err(r#"{"version":1,"jugador":null,"vistas":["u2",""]}"#), Some(Campo));
+    }
+
+    #[test]
+    fn un_jugador_sin_turn_id_en_la_credencial_no_tiene_mandos_ni_es_el_vigente() {
+        let v = vigente("u1", "t1", &[]);
+        assert_eq!(v.mandos(&cred(Rol::Jugador, "u1", None)), Err("TURNO"));
+        // El video lo conserva la misma cuenta (la vista que pasó a jugar), con o sin turnId.
+        assert!(v.video(Rol::Jugador, "u1", None));
+        assert!(!v.video(Rol::Jugador, "u2", None));
+        assert!(!v.video(Rol::Vista, "u2", None));
     }
 
     #[test]
