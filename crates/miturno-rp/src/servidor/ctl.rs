@@ -43,6 +43,7 @@ use rp_core::{
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{sleep_until, timeout, Instant};
 
+use super::whep::SesionesWhep;
 use super::EstadoServidor;
 use crate::sesion::SesionPs5;
 
@@ -68,6 +69,9 @@ const MAX_MENSAJE: usize = 4 * 1024;
 /// Plazo para mandar el último mensaje antes de cerrar (un cliente que no lee no traba la tarea).
 const PLAZO_ENVIO: Duration = Duration::from_secs(1);
 
+/// Los rechazos de `/ctl` por turno (`TURNO`) o por rol (`ROL`): uno por minuto en el registro.
+pub(super) static RECHAZO_MANDOS: crate::registro::Limitado = crate::registro::Limitado::new();
+
 /// Por qué una conexión pierde la ranura (el aviso que recibe).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Expulsion {
@@ -91,31 +95,32 @@ impl Ocupante {
         (self.rol == Rol::Jugador).then_some(self.turn_id.as_deref()).flatten()
     }
 
-    /// ¿Estos autorizados le siguen dando mandos? La regla es la de `/ctl` (`Autorizados::mandos`); de
-    /// la credencial solo importan rol, `sub` y `turnId`.
+    /// ¿Estos autorizados le siguen dando mandos? La regla es la de `/ctl` (`Autorizados::mandos_de`,
+    /// que usa también `Autorizados::mandos`).
     fn sigue_autorizado(&self, a: &Autorizados) -> bool {
-        let c = Credencial {
-            sub: self.sub.clone(),
-            rol: self.rol,
-            turn_id: self.turn_id.clone(),
-            exp: 0,
-            jti: String::new(),
-        };
-        a.mandos(&c).is_ok()
+        a.mandos_de(self.rol, &self.sub, self.turn_id.as_deref()).is_ok()
     }
 }
 
-/// Lo que protege el mismo candado: quién controla, quién puede controlar y la actividad del jugador.
-/// Al arrancar no hay nadie autorizado ni actividad (nada se guarda en disco).
+/// Lo que protege el mismo candado: quién controla, quién puede controlar o ver, la actividad del
+/// jugador y las sesiones WHEP abiertas. Con el mismo candado, un WHEP que se autoriza con el turno
+/// viejo no puede registrarse después de que `/control/turno` calculó a quién expulsar.
+/// Al arrancar no hay nadie autorizado, ni actividad, ni sesiones (nada se guarda en disco).
 pub(super) struct Ranura {
     pub(super) ocupante: Option<Ocupante>,
     autorizados: Autorizados,
     actividad: Actividad,
+    whep: SesionesWhep,
 }
 
 impl Ranura {
     pub(super) fn new() -> Self {
-        Self { ocupante: None, autorizados: Autorizados::vacio(), actividad: Actividad::new() }
+        Self {
+            ocupante: None,
+            autorizados: Autorizados::vacio(),
+            actividad: Actividad::new(),
+            whep: SesionesWhep::default(),
+        }
     }
 }
 
@@ -123,11 +128,13 @@ impl Ranura {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct VersionVieja(pub(super) u64);
 
-/// Lo que hizo `/control/turno`: la versión que había y la conexión que cortó, si hubo.
+/// Lo que hizo `/control/turno`: la versión que había, la conexión que cortó, si hubo, y las sesiones
+/// WHEP que ya no tienen video (para expulsar).
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct TurnoAplicado {
     pub(super) anterior: u64,
     pub(super) cortada: Option<u64>,
+    pub(super) expulsar: Vec<String>,
 }
 
 /// Lugares para las conexiones que todavía no se autenticaron: el tope global y el de cada IP.
@@ -306,17 +313,35 @@ impl<S: SesionPs5> EstadoServidor<S> {
             }
             r.autorizados = a;
             r.actividad.turno(r.autorizados.jugador.as_ref().map(|j| j.turn_id.as_str()), ahora);
+            let expulsar = r.whep.no_autorizadas(&r.autorizados);
             let autorizados = &r.autorizados;
             let Some(o) = r.ocupante.take_if(|o| !o.sigue_autorizado(autorizados)) else {
-                return Ok(TurnoAplicado { anterior, cortada: None });
+                return Ok(TurnoAplicado { anterior, cortada: None, expulsar });
             };
             self.sesion.poner_mando(&EstadoMando::suelto());
             if let Some(t) = o.turno_jugador() {
                 r.actividad.soltar(t, ahora);
             }
             let _ = o.aviso.send(Expulsion::Revocada);
-            Ok(TurnoAplicado { anterior, cortada: Some(o.id) })
+            Ok(TurnoAplicado { anterior, cortada: Some(o.id), expulsar })
         })
+    }
+
+    /// Un WHEP de `ps5` con una credencial ya validada: ¿lo deja ver el turno vigente
+    /// (`Autorizados::video`)? Si sí, registra la sesión `id` (si es un UUID) con el mismo candado que
+    /// los autorizados y devuelve las anteriores de la misma cuenta, para expulsarlas. `None`: no ve.
+    pub(super) fn autorizar_whep(&self, c: &Credencial, id: Option<&str>) -> Option<Vec<String>> {
+        self.con_ranura(|r| {
+            if !r.autorizados.video(c.rol, &c.sub, c.turn_id.as_deref()) {
+                return None;
+            }
+            Some(id.map(|id| r.whep.registrar(id, c.rol, &c.sub, c.turn_id.as_deref())).unwrap_or_default())
+        })
+    }
+
+    /// Saca del registro una sesión WHEP ya expulsada.
+    pub(super) fn quitar_whep(&self, id: &str) {
+        self.con_ranura(|r| r.whep.quitar(id));
     }
 
     /// `VideoSalud.jugador`: el turno vigente guardado, quién controla y la inactividad del jugador.
@@ -455,7 +480,13 @@ async fn conexion<S: SesionPs5>(e: Arc<EstadoServidor<S>>, mut socket: WebSocket
     let (dueno, mut aviso) = match e.tomar(id, &cred) {
         Ok(t) => t,
         Err(codigo) => {
-            crate::info!("ctl: conexión {id} (rol={}) rechazada ({codigo})", nombre_rol(cred.rol));
+            // `TURNO` y `ROL` los puede provocar cualquiera con una credencial válida (también se
+            // esperan en la carrera del arranque del turno): limitados, como la credencial rechazada.
+            if codigo == "OCUPADO" {
+                crate::info!("ctl: conexión {id} (rol={}) rechazada ({codigo})", nombre_rol(cred.rol));
+            } else {
+                crate::limitado!(6, RECHAZO_MANDOS, "ctl: conexión {id} (rol={}) rechazada ({codigo})", nombre_rol(cred.rol));
+            }
             return despedir(socket, Some(MsgServidor::error(codigo))).await;
         }
     };

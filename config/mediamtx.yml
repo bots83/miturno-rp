@@ -21,8 +21,12 @@ udpReadBufferSize: 8388608
 ###############################################
 # Autenticación: cada pedido lo decide miturno-rp (POST /interno/auth, solo 127.0.0.1).
 # - publish y read por RTSP o UDP desde la máquina: se permiten;
-# - read por WebRTC (WHEP) de ps5: con una credencial de turno válida de rol operador. MediaMTX la
-#   saca del encabezado "Authorization: Bearer <credencial>" y la manda en el campo "token" del JSON;
+# - read por WebRTC (WHEP) de ps5: con una credencial de turno válida: el operador siempre, el jugador
+#   del turno vigente y las vistas que empuja la api. MediaMTX la saca del encabezado
+#   "Authorization: Bearer <credencial>" y la manda en el campo "token" del JSON, junto con el "id" de
+#   la sesión (el UUID de /v3/webrtcsessions/list), que miturno-rp anota para expulsarla cuando deja de
+#   corresponder (MediaMTX no vuelve a validar una sesión abierta);
+# - la API (action: api) desde 127.0.0.1: la usa miturno-rp para esas expulsiones;
 # - todo lo demás: no.
 
 authMethod: http
@@ -39,13 +43,20 @@ authHTTPExclude:
 ###############################################
 # Servidores que no se usan: apagados.
 
-api: false
 metrics: false
 pprof: false
 playback: false
 hls: false
 srt: false
 moq: false
+
+###############################################
+# API: solo local, nunca por Caddy (que solo lleva a 8889 y a miturno-rp). La usa miturno-rp para
+# expulsar sesiones WHEP (POST /v3/webrtcsessions/kick/<id>); cada pedido lo autoriza /interno/auth
+# con action: api, solo desde 127.0.0.1.
+
+api: true
+apiAddress: 127.0.0.1:9997
 
 ###############################################
 # RTSP: solo local, solo TCP (sin los puertos UDP 8000/8001 de RTP/RTCP abiertos a todas las

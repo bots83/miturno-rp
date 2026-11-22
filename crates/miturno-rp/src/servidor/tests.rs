@@ -72,6 +72,24 @@ fn token_vista(sub: &str) -> String {
     firmar(&c)
 }
 
+/// Credencial de operador de la cuenta `sub`.
+fn token_operador(sub: &str) -> String {
+    let mut c = claims("operador");
+    c["sub"] = json!(sub);
+    firmar(&c)
+}
+
+/// Un `id` de sesión WHEP como los de MediaMTX (UUID en minúsculas).
+fn uuid(n: u32) -> String {
+    format!("{n:08x}-0000-4000-8000-{n:012x}")
+}
+
+/// Cuerpo de `/control/turno` con vistas.
+fn cuerpo_autorizados(version: u64, jugador: Option<(&str, &str)>, vistas: &[&str]) -> String {
+    let j = jugador.map(|(sub, t)| json!({"sub":sub,"turnId":t})).unwrap_or(Value::Null);
+    json!({"version":version,"jugador":j,"vistas":vistas}).to_string()
+}
+
 /// Cuerpo de `/control/turno` sin vistas.
 fn cuerpo_turno(version: u64, jugador: Option<(&str, &str)>) -> String {
     let j = jugador.map(|(sub, t)| json!({"sub":sub,"turnId":t})).unwrap_or(Value::Null);
@@ -94,6 +112,9 @@ struct SistemaFalso {
     llamadas: Mutex<Vec<(String, String)>>,
     falla_systemctl: Mutex<bool>,
     cpu: Mutex<VecDeque<TiemposCpu>>,
+    /// Cada `expulsar_whep` pedido (también los que fallan), en orden.
+    expulsiones: Mutex<Vec<String>>,
+    falla_expulsion: Mutex<bool>,
 }
 
 impl Sistema for SistemaFalso {
@@ -105,6 +126,11 @@ impl Sistema for SistemaFalso {
     fn systemctl<'a>(&'a self, verbo: &'a str, unidad: &'a str) -> Futuro<'a, Result<(), String>> {
         self.llamadas.lock().unwrap().push((verbo.into(), unidad.into()));
         let r = if *self.falla_systemctl.lock().unwrap() { Err("polkit dijo que no".into()) } else { Ok(()) };
+        Box::pin(std::future::ready(r))
+    }
+    fn expulsar_whep<'a>(&'a self, id: &'a str) -> Futuro<'a, Result<(), String>> {
+        self.expulsiones.lock().unwrap().push(id.into());
+        let r = if *self.falla_expulsion.lock().unwrap() { Err("la API de MediaMTX no contesta".into()) } else { Ok(()) };
         Box::pin(std::future::ready(r))
     }
     fn tiempos_cpu(&self) -> Option<TiemposCpu> {
@@ -234,6 +260,23 @@ impl Banco {
 
     async fn auth_mediamtx(&self, cuerpo: Value) -> StatusCode {
         self.pedir("POST", "/interno/auth", local(), None, &cuerpo.to_string()).await.0
+    }
+
+    /// Empuja el turno vigente con vistas y exige `200 {"ok":true}`.
+    async fn empujar_con(&self, version: u64, jugador: Option<(&str, &str)>, vistas: &[&str]) {
+        let (st, cuerpo) = self.turno(&cuerpo_autorizados(version, jugador, vistas)).await;
+        assert_eq!((st, cuerpo.as_str()), (StatusCode::OK, r#"{"ok":true}"#), "empuje v{version}");
+    }
+
+    /// Lo que contesta `/interno/auth` a un WHEP de `ps5` con esa credencial y ese `id` de sesión.
+    async fn ver(&self, token: &str, id: Option<&str>) -> StatusCode {
+        self.auth_mediamtx(whep(token, id)).await
+    }
+
+    /// Las expulsiones pedidas hasta ahora (después de dejar correr las tareas en segundo plano).
+    async fn expulsiones(&self) -> Vec<String> {
+        sleep(Duration::from_millis(5)).await;
+        self.sistema.expulsiones.lock().unwrap().clone()
     }
 }
 
@@ -889,7 +932,11 @@ async fn interno_auth_tabla_de_casos() {
         (auth("read", "hls", "198.51.100.7", "ps5", &op), StatusCode::UNAUTHORIZED),
         (auth("publish", "rtmp", "127.0.0.1", "ps5", ""), StatusCode::UNAUTHORIZED),
         (auth("publish", "srt", "127.0.0.1", "ps5", ""), StatusCode::UNAUTHORIZED),
-        (auth("api", "", "127.0.0.1", "", ""), StatusCode::UNAUTHORIZED),
+        // La API de MediaMTX (solo la usa miturno-rp para expulsar sesiones WHEP): solo local.
+        (auth("api", "", "127.0.0.1", "", ""), StatusCode::OK),
+        (auth("api", "", "::1", "", ""), StatusCode::OK),
+        (auth("api", "", "198.51.100.7", "", ""), StatusCode::UNAUTHORIZED),
+        (auth("api", "", "", "", ""), StatusCode::UNAUTHORIZED),
         (auth("metrics", "", "127.0.0.1", "", ""), StatusCode::UNAUTHORIZED),
         (auth("playback", "", "127.0.0.1", "ps5", &op), StatusCode::UNAUTHORIZED),
         (auth("pprof", "", "127.0.0.1", "", ""), StatusCode::UNAUTHORIZED),
@@ -897,6 +944,143 @@ async fn interno_auth_tabla_de_casos() {
     for (cuerpo, esperado) in casos {
         assert_eq!(b.auth_mediamtx(cuerpo.clone()).await, esperado, "{cuerpo}");
     }
+}
+
+fn whep(token: &str, id: Option<&str>) -> Value {
+    let mut c = auth("read", "webrtc", "198.51.100.7", "ps5", token);
+    c["id"] = json!(id);
+    c
+}
+
+#[tokio::test(start_paused = true)]
+async fn interno_auth_whep_segun_el_turno_vigente_y_las_vistas() {
+    let b = banco();
+    b.empujar_con(1, Some(("u1", "t1")), &["u2"]).await;
+    let id = uuid(1);
+    let casos: Vec<(&str, String, StatusCode)> = vec![
+        ("jugador del turno vigente", token_jugador("u1", "t1"), StatusCode::OK),
+        ("vista en vistas", token_vista("u2"), StatusCode::OK),
+        ("vista que no está", token_vista("u3"), StatusCode::UNAUTHORIZED),
+        ("jugador de otro turno y otra cuenta", token_jugador("u9", "t0"), StatusCode::UNAUTHORIZED),
+        ("misma cuenta que el vigente (la vista que pasó a jugar)", token_jugador("u1", "t0"), StatusCode::OK),
+        ("operador", token_operador("op"), StatusCode::OK),
+    ];
+    for (que, t, esperado) in casos {
+        assert_eq!(b.ver(&t, Some(&id)).await, esperado, "{que}");
+        assert_eq!(b.ver(&t, None).await, esperado, "{que}, sin id");
+    }
+    let mut otra_ruta = whep(&token_jugador("u1", "t1"), Some(&id));
+    otra_ruta["path"] = json!("kick-humo");
+    assert_eq!(b.auth_mediamtx(otra_ruta).await, StatusCode::UNAUTHORIZED, "solo la ruta ps5");
+    let mut vencido = claims("vista");
+    vencido["sub"] = json!("u2");
+    vencido["exp"] = json!(AHORA - 31);
+    assert_eq!(b.ver(&firmar(&vencido), Some(&id)).await, StatusCode::UNAUTHORIZED, "credencial vencida");
+    // Sin empuje (como tras un reinicio) solo pasa el operador.
+    let b = banco();
+    assert_eq!(b.ver(&token_jugador("u1", "t1"), None).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(b.ver(&token_vista("u2"), None).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(b.ver(&token_operador("op"), None).await, StatusCode::OK);
+}
+
+#[tokio::test(start_paused = true)]
+async fn whep_al_cambiar_el_turno_se_expulsa_a_quien_ya_no_tiene_video() {
+    // Review Focus 4: MediaMTX no vuelve a validar una sesión abierta.
+    let b = banco();
+    b.empujar_con(1, Some(("u1", "t1")), &["u2"]).await;
+    let (s1, s2, op) = (uuid(1), uuid(2), uuid(3));
+    assert_eq!(b.ver(&token_jugador("u1", "t1"), Some(&s1)).await, StatusCode::OK);
+    assert_eq!(b.ver(&token_vista("u2"), Some(&s2)).await, StatusCode::OK);
+    assert_eq!(b.ver(&token_operador("op"), Some(&op)).await, StatusCode::OK);
+    assert!(b.expulsiones().await.is_empty(), "abrir una sesión de otra cuenta no expulsa a nadie");
+    // u2 pasa a jugar (con su credencial de vista todavía abierta): conserva el video; u1 lo pierde.
+    b.empujar_con(2, Some(("u2", "t2")), &["u3"]).await;
+    assert_eq!(b.expulsiones().await, vec![s1.clone()]);
+    // Termina el turno y no queda nadie: se va u2. La del operador, nunca.
+    b.empujar_con(3, None, &[]).await;
+    assert_eq!(b.expulsiones().await, vec![s1.clone(), s2.clone()], "u1 ya se expulsó: no se repite");
+    b.empujar_con(4, None, &[]).await;
+    assert_eq!(b.expulsiones().await, vec![s1, s2]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn whep_una_cuenta_tiene_una_sola_sesion_y_el_operador_varias() {
+    let b = banco();
+    b.empujar_con(1, Some(("u1", "t1")), &["u2"]).await;
+    let (a, c) = (uuid(1), uuid(2));
+    assert_eq!(b.ver(&token_jugador("u1", "t1"), Some(&a)).await, StatusCode::OK);
+    assert_eq!(b.ver(&token_jugador("u1", "t1"), Some(&c)).await, StatusCode::OK, "otra pestaña");
+    assert_eq!(b.expulsiones().await, vec![a.clone()], "la nueva expulsa a la anterior");
+    // El mismo id otra vez (MediaMTX no lo hace, pero por las dudas) no se expulsa a sí mismo.
+    assert_eq!(b.ver(&token_jugador("u1", "t1"), Some(&c)).await, StatusCode::OK);
+    assert_eq!(b.expulsiones().await, vec![a.clone()]);
+    // La vista que pasa a jugar y abre otra sesión con la credencial nueva: se va la de vista.
+    let (v, j) = (uuid(3), uuid(4));
+    assert_eq!(b.ver(&token_vista("u2"), Some(&v)).await, StatusCode::OK);
+    b.empujar_con(2, Some(("u2", "t2")), &[]).await;
+    assert_eq!(b.ver(&token_jugador("u2", "t2"), Some(&j)).await, StatusCode::OK);
+    let exp = b.expulsiones().await;
+    assert!(exp.contains(&v) && !exp.contains(&j), "{exp:?}");
+    // Dos del operador conviven, y ningún empuje las toca.
+    let (o1, o2) = (uuid(5), uuid(6));
+    let antes = b.expulsiones().await.len();
+    assert_eq!(b.ver(&token_operador("op"), Some(&o1)).await, StatusCode::OK);
+    assert_eq!(b.ver(&token_operador("op"), Some(&o2)).await, StatusCode::OK);
+    b.empujar_con(3, None, &[]).await;
+    let exp = b.expulsiones().await;
+    assert!(!exp.contains(&o1) && !exp.contains(&o2), "{exp:?}");
+    assert!(exp.len() > antes, "el empuje sí expulsa a los demás: {exp:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn whep_un_id_que_no_es_uuid_se_autoriza_pero_no_se_registra() {
+    let b = banco();
+    b.empujar_con(1, Some(("u1", "t1")), &[]).await;
+    let t = token_jugador("u1", "t1");
+    let raros = [
+        "x; rm -rf /",
+        "../../v3/config/global/patch",
+        "00000001-0000-4000-8000-00000000000G",
+        "00000001-0000-4000-8000-00000000000A",
+        "00000001-0000-4000-8000-0000000000001",
+        "000000010000-4000-8000-000000000001",
+        "",
+    ];
+    for id in raros {
+        assert_eq!(b.ver(&t, Some(id)).await, StatusCode::OK, "{id:?}");
+    }
+    assert_eq!(b.ver(&t, None).await, StatusCode::OK, "id null (como en un OPTIONS)");
+    let bueno = uuid(1);
+    assert_eq!(b.ver(&t, Some(&bueno)).await, StatusCode::OK);
+    assert!(b.expulsiones().await.is_empty(), "nada raro se registró como sesión anterior");
+    b.empujar_con(2, None, &[]).await;
+    assert_eq!(b.expulsiones().await, vec![bueno], "solo el UUID llega a expulsar_whep");
+}
+
+#[tokio::test(start_paused = true)]
+async fn whep_si_la_expulsion_falla_se_reintenta_en_el_proximo_empuje() {
+    let b = banco();
+    b.empujar_con(1, Some(("u1", "t1")), &[]).await;
+    let s = uuid(1);
+    assert_eq!(b.ver(&token_jugador("u1", "t1"), Some(&s)).await, StatusCode::OK);
+    *b.sistema.falla_expulsion.lock().unwrap() = true;
+    b.empujar_con(2, None, &[]).await;
+    assert_eq!(b.expulsiones().await, vec![s.clone()]);
+    *b.sistema.falla_expulsion.lock().unwrap() = false;
+    b.empujar_con(3, None, &[]).await;
+    assert_eq!(b.expulsiones().await, vec![s.clone(), s.clone()], "sigue registrada: se reintenta");
+    b.empujar_con(4, None, &[]).await;
+    assert_eq!(b.expulsiones().await, vec![s.clone(), s], "expulsada: ya no se intenta");
+}
+
+#[tokio::test(start_paused = true)]
+async fn whep_un_empuje_con_version_vieja_no_expulsa_a_nadie() {
+    let b = banco();
+    b.empujar_con(5, Some(("u1", "t1")), &[]).await;
+    assert_eq!(b.ver(&token_jugador("u1", "t1"), Some(&uuid(1))).await, StatusCode::OK);
+    let (st, _) = b.turno(&cuerpo_autorizados(4, None, &[])).await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert!(b.expulsiones().await.is_empty());
 }
 
 #[tokio::test(start_paused = true)]
@@ -1387,9 +1571,28 @@ async fn tras_un_reinicio_el_jugador_recibe_turno_hasta_el_empuje_y_despues_ok()
     let t = token_jugador("u1", "t1");
     let (_, r) = b.ws_con(&t).await;
     assert_eq!(r, json!({"t":"error","codigo":"TURNO"}));
+    // La api tarda en reenviar: la inactividad cuenta desde el empuje, no desde el arranque.
+    sleep(Duration::from_secs(30)).await;
     b.empujar(7, Some(("u1", "t1"))).await;
     let j = b.salud_jugador().await;
     assert_eq!((j["version"].clone(), j["turnId"].clone()), (json!(7), json!("t1")));
+    assert!(j["inactivoMs"].as_u64().is_some_and(|ms| ms <= 100), "{j}");
     let (_ws, r) = b.ws_con(&t).await;
     assert_eq!(r, json!({"t":"ok","rol":"jugador"}));
+}
+
+#[tokio::test(start_paused = true)]
+async fn ctl_los_rechazos_turno_y_rol_pasan_por_el_limitador() {
+    // /ctl es público: un rechazo por turno o por rol no puede llenar el journal (uno por minuto).
+    use crate::registro::{ms_desde_arranque, CADA_RECHAZO_MS};
+    let b = banco();
+    for (t, codigo) in [(token_jugador("u1", "t1"), "TURNO"), (token_vista("u2"), "ROL")] {
+        let (_, r) = b.ws_con(&t).await;
+        assert_eq!(r, json!({"t":"error","codigo":codigo}));
+        assert_eq!(
+            ctl::RECHAZO_MANDOS.permitir(ms_desde_arranque(), CADA_RECHAZO_MS),
+            None,
+            "{codigo}: el limitador ya registró un aviso en el último minuto"
+        );
+    }
 }

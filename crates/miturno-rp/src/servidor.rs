@@ -2,16 +2,20 @@
 //!
 //! - `GET /ctl` (WebSocket, detrás de Caddy): los mandos de quien juega, con la credencial de turno.
 //! - `POST /interno/auth` (autenticación externa de MediaMTX) y `POST /interno/keyframe`: solo desde
-//!   la misma máquina y nunca a través del proxy.
+//!   la misma máquina y nunca a través del proxy. Cada WHEP autorizado se registra (`whep.rs`) para
+//!   expulsarlo por la API local de MediaMTX cuando deja de corresponder: MediaMTX no vuelve a validar
+//!   una sesión abierta. Una cuenta (salvo el operador) tiene una sola sesión.
 //! - `GET /control/salud` y `POST /control/{reconectar,kick_on,kick_off,reposo,encender,turno}`: solo con
 //!   el token de control de la api (nunca con la credencial del navegador). `turno` recibe el turno
-//!   vigente y las vistas (`leer_autorizados`); al arrancar no hay ninguno (nada en disco).
+//!   vigente y las vistas (`leer_autorizados`); al arrancar no hay ninguno (nada en disco). Después de
+//!   responder, expulsa en segundo plano las sesiones WHEP que ya no tienen video.
 //!
 //! Nunca se registran credenciales, tokens ni el nombre de la conexión de casa.
 
 mod ctl;
 #[cfg(test)]
 mod tests;
+pub(crate) mod whep;
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
@@ -26,7 +30,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use rp_core::{leer_autorizados, validar_con, ClaveVerificacion, Rol};
+use rp_core::{leer_autorizados, validar_con, ClaveVerificacion, Credencial};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use subtle::ConstantTimeEq;
@@ -228,6 +232,8 @@ async fn solo_local(ConnectInfo(par): ConnectInfo<SocketAddr>, req: Request, nex
 }
 
 /// Lo que manda MediaMTX (v1.21) a la autenticación externa. Los campos nuevos se ignoran.
+/// `id`: el UUID de la sesión (el mismo de `/v3/webrtcsessions/list`) en `read` y `publish`; `null`
+/// en los pedidos que no abren sesión (como el `OPTIONS` de WHEP) y en `api`.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct PedidoAuth {
@@ -236,21 +242,34 @@ struct PedidoAuth {
     action: Option<String>,
     path: Option<String>,
     protocol: Option<String>,
+    id: Option<String>,
+}
+
+/// Lo que decide `/interno/auth` sin mirar el turno vigente.
+enum Permiso {
+    No,
+    Si,
+    /// WHEP de `ps5` con una credencial válida: falta ver si el turno vigente le da video.
+    Whep(Credencial),
 }
 
 /// - `publish` y `read` por RTSP o UDP desde la máquina: ffmpeg de Kick, la entrada UDP y (F2) el vigilante;
-/// - `read` por WebRTC (WHEP) de `ps5` con una credencial válida de `operador` (en F1 solo pasa el operador);
-/// - todo lo demás (API, métricas, HLS, RTMP, SRT, otras rutas): no.
-fn permitir_mediamtx(p: &PedidoAuth, clave: &ClaveVerificacion, ahora_s: u64) -> bool {
+/// - `read` por WebRTC (WHEP) de `ps5` con una credencial válida: el operador siempre, el jugador y las
+///   vistas según `Autorizados::video` (lo decide `EstadoServidor::autorizar_whep`);
+/// - `api` desde la máquina: la usa miturno-rp para expulsar sesiones WHEP (la API escucha solo en
+///   127.0.0.1 y Caddy nunca lleva a ella);
+/// - todo lo demás (métricas, pprof, playback, HLS, RTMP, SRT, otras rutas): no.
+fn permiso_mediamtx(p: &PedidoAuth, clave: &ClaveVerificacion, ahora_s: u64) -> Permiso {
     let s = |o: &Option<String>| o.as_deref().unwrap_or("").to_string();
     let local = s(&p.ip).parse::<IpAddr>().is_ok_and(|ip| ip.to_canonical().is_loopback());
+    let si = |b: bool| if b { Permiso::Si } else { Permiso::No };
     match (s(&p.action).as_str(), s(&p.protocol).as_str()) {
-        ("publish" | "read", "rtsp" | "udp") => local,
-        ("read", "webrtc") => {
-            s(&p.path) == RUTA_PS5
-                && validar_con(&s(&p.token), clave, ahora_s).is_ok_and(|c| c.rol == Rol::Operador)
+        ("publish" | "read", "rtsp" | "udp") => si(local),
+        ("api", _) => si(local),
+        ("read", "webrtc") if s(&p.path) == RUTA_PS5 => {
+            validar_con(&s(&p.token), clave, ahora_s).map_or(Permiso::No, Permiso::Whep)
         }
-        _ => false,
+        _ => Permiso::No,
     }
 }
 
@@ -260,7 +279,17 @@ async fn auth_mediamtx<S: SesionPs5>(State(e): State<Compartido<S>>, cuerpo: Byt
         crate::limitado!(4, LIM, "interno/auth: cuerpo inválido; rechazado");
         return StatusCode::UNAUTHORIZED;
     };
-    let permitido = permitir_mediamtx(&p, &e.clave, (e.reloj_s)());
+    let permitido = match permiso_mediamtx(&p, &e.clave, (e.reloj_s)()) {
+        Permiso::No => false,
+        Permiso::Si => true,
+        Permiso::Whep(c) => match e.autorizar_whep(&c, p.id.as_deref()) {
+            None => false,
+            Some(anteriores) => {
+                e.expulsar_whep(anteriores, "otra sesión de la misma cuenta");
+                true
+            }
+        },
+    };
     crate::depurar!(
         "interno/auth: {} por {} en {:?}: {}",
         p.action.as_deref().unwrap_or("?"),
@@ -272,6 +301,33 @@ async fn auth_mediamtx<S: SesionPs5>(State(e): State<Compartido<S>>, cuerpo: Byt
         StatusCode::OK
     } else {
         StatusCode::UNAUTHORIZED
+    }
+}
+
+impl<S: SesionPs5> EstadoServidor<S> {
+    /// Expulsa esas sesiones WHEP en segundo plano (el pedido que las provocó no espera a `curl`). La
+    /// que se expulsa (o que ya no existía) sale del registro; si falla, queda y se reintenta con el
+    /// próximo empuje. En el registro, solo los 8 primeros caracteres del `id` (como MediaMTX).
+    fn expulsar_whep(self: &Arc<Self>, ids: Vec<String>, motivo: &'static str) {
+        if ids.is_empty() {
+            return;
+        }
+        let e = self.clone();
+        tokio::spawn(async move {
+            for id in ids {
+                let corto = id.get(..8).unwrap_or("");
+                match e.sistema.expulsar_whep(&id).await {
+                    Ok(()) => {
+                        e.quitar_whep(&id);
+                        crate::info!("whep: sesión {corto} expulsada ({motivo})");
+                    }
+                    Err(m) => {
+                        static LIM: crate::registro::Limitado = crate::registro::Limitado::new();
+                        crate::limitado!(4, LIM, "whep: no se pudo expulsar la sesión {corto} ({motivo}): {m}");
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -327,7 +383,8 @@ async fn kick<S: SesionPs5>(e: &EstadoServidor<S>, verbo: &str) -> Response {
 
 /// `POST /control/turno`: el turno vigente y las vistas que publica la api. `200` recién después de
 /// cortar al jugador que ya no corresponde; `409 VERSION` si la versión es menor que la guardada;
-/// `400 FORMATO` si el cuerpo no es el JSON exacto.
+/// `400 FORMATO` si el cuerpo no es el JSON exacto. Las sesiones WHEP que se quedaron sin video se
+/// expulsan en segundo plano (la respuesta no espera a la API de MediaMTX).
 async fn turno<S: SesionPs5>(State(e): State<Compartido<S>>, cuerpo: Bytes) -> Response {
     let Some(a) = std::str::from_utf8(&cuerpo).ok().and_then(|t| leer_autorizados(t).ok()) else {
         static LIM: crate::registro::Limitado = crate::registro::Limitado::new();
@@ -350,6 +407,7 @@ async fn turno<S: SesionPs5>(State(e): State<Compartido<S>>, cuerpo: Bytes) -> R
             if let Some(id) = hecho.cortada {
                 crate::info!("control/turno: la conexión {id} ya no tiene turno; mandos cortados");
             }
+            e.expulsar_whep(hecho.expulsar, "ya no tiene video");
             ok()
         }
     }

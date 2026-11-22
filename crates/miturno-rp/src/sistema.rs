@@ -1,6 +1,6 @@
 //! Lo que el servidor consulta o cambia de la máquina: estado de unidades de systemd, arrancar o
-//! parar la salida a Kick y los tiempos de CPU de `/proc/stat`. Detrás de un trait para que los tests
-//! no dependan del host.
+//! parar la salida a Kick, los tiempos de CPU de `/proc/stat` y la expulsión de sesiones WHEP por la
+//! API local de MediaMTX. Detrás de un trait para que los tests no dependan del host.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -22,10 +22,17 @@ pub trait Sistema: Send + Sync + 'static {
     /// `systemctl <verbo> <unidad>` (sin esperar al trabajo). El error es para el registro.
     fn systemctl<'a>(&'a self, verbo: &'a str, unidad: &'a str) -> Futuro<'a, Result<(), String>>;
     fn tiempos_cpu(&self) -> Option<TiemposCpu>;
+    /// Cierra la sesión WHEP `id` (un UUID ya validado) en MediaMTX. Si ya no existe, también es `Ok`.
+    /// El error es para el registro.
+    fn expulsar_whep<'a>(&'a self, id: &'a str) -> Futuro<'a, Result<(), String>>;
 }
 
 /// Plazo para cualquier llamada a `systemctl`.
 const PLAZO_SYSTEMCTL: Duration = Duration::from_secs(3);
+/// API de MediaMTX: solo en 127.0.0.1 (`apiAddress` de config/mediamtx.yml), nunca por Caddy.
+pub const API_MEDIAMTX: &str = "http://127.0.0.1:9997";
+/// Plazo para el proceso de `curl` (que ya se corta solo a los 2 s con `--max-time`).
+const PLAZO_CURL: Duration = Duration::from_secs(3);
 
 /// La máquina de verdad.
 pub struct SistemaReal;
@@ -70,6 +77,37 @@ impl Sistema for SistemaReal {
     fn tiempos_cpu(&self) -> Option<TiemposCpu> {
         parsear_proc_stat(&std::fs::read_to_string("/proc/stat").ok()?)
     }
+
+    fn expulsar_whep<'a>(&'a self, id: &'a str) -> Futuro<'a, Result<(), String>> {
+        Box::pin(expulsar_con_curl(API_MEDIAMTX, id))
+    }
+}
+
+/// `POST <api>/v3/webrtcsessions/kick/<id>` con `curl` (sin shell, como el `runOnRead` de MediaMTX).
+/// `200` es expulsada y `404`, que ya no estaba; cualquier otra cosa es un error.
+/// El `id` se vuelve a validar acá (el registro ya solo guarda UUID): nada raro llega a la URL.
+pub async fn expulsar_con_curl(api: &str, id: &str) -> Result<(), String> {
+    if !crate::servidor::whep::es_uuid(id) {
+        return Err("el id de la sesión no es un UUID".into());
+    }
+    let url = format!("{api}/v3/webrtcsessions/kick/{id}");
+    let salida = tokio::time::timeout(
+        PLAZO_CURL,
+        tokio::process::Command::new("curl")
+            .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "2", "-X", "POST", &url])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await;
+    match salida {
+        Err(_) => Err(format!("curl no terminó en {} s", PLAZO_CURL.as_secs())),
+        Ok(Err(e)) => Err(format!("curl: {e}")),
+        Ok(Ok(o)) if !o.status.success() => Err(format!("curl: {}", o.status)),
+        Ok(Ok(o)) => match String::from_utf8_lossy(&o.stdout).trim() {
+            "200" | "404" => Ok(()),
+            codigo => Err(format!("la API de MediaMTX respondió {codigo}")),
+        },
+    }
 }
 
 /// Una línea por unidad; lo que falte es `"desconocido"`.
@@ -105,6 +143,67 @@ pub fn cpu_por_ciento(antes: TiemposCpu, ahora: TiemposCpu) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::{Method, StatusCode, Uri};
+    use std::sync::{Arc, Mutex};
+
+    /// API de MediaMTX falsa en un puerto libre de 127.0.0.1: contesta lo que dice `respuesta` según el
+    /// id, y anota (método, ruta) de cada pedido.
+    async fn api_falsa(respuesta: fn(&str) -> StatusCode) -> (String, Arc<Mutex<Vec<(Method, String)>>>) {
+        let pedidos = Arc::new(Mutex::new(Vec::new()));
+        let p = pedidos.clone();
+        let app = axum::Router::new().fallback(move |metodo: Method, uri: Uri| {
+            let p = p.clone();
+            async move {
+                p.lock().unwrap().push((metodo.clone(), uri.path().to_string()));
+                match uri.path().strip_prefix("/v3/webrtcsessions/kick/") {
+                    Some(id) if metodo == Method::POST => respuesta(id),
+                    _ => StatusCode::METHOD_NOT_ALLOWED,
+                }
+            }
+        });
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dir = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        (dir, pedidos)
+    }
+
+    const ID: &str = "0f8e7d6c-5b4a-4321-8fed-cba987654321";
+
+    #[tokio::test]
+    async fn expulsar_con_curl_hace_el_post_del_kick_y_toma_200_y_404_como_expulsada() {
+        let (api, pedidos) = api_falsa(|id| match id {
+            "0f8e7d6c-5b4a-4321-8fed-cba987654321" => StatusCode::OK,
+            "00000000-0000-4000-8000-000000000404" => StatusCode::NOT_FOUND,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        })
+        .await;
+        assert_eq!(expulsar_con_curl(&api, ID).await, Ok(()));
+        assert_eq!(expulsar_con_curl(&api, "00000000-0000-4000-8000-000000000404").await, Ok(()), "ya no estaba");
+        let error = expulsar_con_curl(&api, "00000000-0000-4000-8000-000000000500").await;
+        assert!(error.as_ref().is_err_and(|m| m.contains("500")), "{error:?}");
+        assert_eq!(
+            pedidos.lock().unwrap()[0],
+            (Method::POST, format!("/v3/webrtcsessions/kick/{ID}")),
+            "un solo POST a la ruta del kick"
+        );
+        assert_eq!(pedidos.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn expulsar_con_curl_sin_la_api_es_un_error() {
+        // Un puerto que se acaba de liberar: nadie escucha.
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = format!("http://{}", l.local_addr().unwrap());
+        drop(l);
+        assert!(expulsar_con_curl(&api, ID).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn expulsar_con_curl_no_lanza_nada_con_un_id_que_no_es_uuid() {
+        let (api, pedidos) = api_falsa(|_| StatusCode::OK).await;
+        assert!(expulsar_con_curl(&api, "x/../../v3/config").await.is_err());
+        assert!(pedidos.lock().unwrap().is_empty());
+    }
 
     const STAT: &str = "cpu  100 5 50 800 20 3 2 10 7 0\ncpu0 50 2 25 400 10 1 1 5 3 0\nintr 12345\n";
 
