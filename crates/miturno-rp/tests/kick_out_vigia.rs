@@ -251,10 +251,11 @@ fn kick_sale_entera_y_el_cuadro_es_un_ppm_completo() {
             verificar_ppm(&datos);
             lecturas += 1;
         }
-        sleep(Duration::from_millis(5));
+        sleep(Duration::from_millis(25));
     }
     let salida = proceso.0.take().unwrap().wait_with_output().unwrap();
     exito(&salida);
+    assert!(lecturas > 0, "el sondeo tuvo que leer el cuadro mientras ffmpeg escribía");
 
     assert_eq!(cuadros_flv(&flv), CUADROS, "4 s a 60 fps por Kick");
     verificar_ppm(&fs::read(&cuadro).expect("el cuadro final existe"));
@@ -298,8 +299,9 @@ fn la_rama_vigia_saca_un_cuadro_de_cada_60_sin_duplicar() {
     }
 }
 
-/// Corre la unidad a ritmo real, borra la carpeta de cuadros a los 1,5 s y, si `parar_a` viene, manda
-/// SIGTERM a ffmpeg en ese momento (como `kick_off`). Devuelve la salida de ffmpeg y los cuadros del `.flv`.
+/// Corre la unidad a ritmo real y borra la carpeta de cuadros 0,5 s después de que aparece el primero.
+/// Si `parar_a` viene, manda SIGTERM a ffmpeg (como `kick_off`) ese tiempo después del primer cuadro.
+/// Devuelve la salida de ffmpeg y los cuadros del `.flv`.
 fn kick_con_la_salida_de_cuadros_rota(nombre: &str, parar_a: Option<Duration>) -> (Output, u64) {
     let tmp = Temporal::nueva(nombre);
     let flv = tmp.0.join("kick.flv");
@@ -314,18 +316,20 @@ fn kick_con_la_salida_de_cuadros_rota(nombre: &str, parar_a: Option<Duration>) -
     let hijo = c.stdout(Stdio::null()).stderr(Stdio::piped()).spawn().expect("lanzar ffmpeg");
     let mut proceso = Proceso(Some(hijo));
 
-    // A ritmo real salen cuadros del vigía en t = 0, 1, 2 y 3 s. Se borra la carpeta a los 1,5 s
-    // (después de ver el primer cuadro): fallan los de 2 y 3 s.
+    // A ritmo real, el cuadro vigía k sale en t0 + k s, con t0 cuando aparece el primero (lo que
+    // tarde ffmpeg en arrancar no cuenta). Se borra la carpeta en t0 + 0,5 s: fallan los de t0 + 1,
+    // + 2 y + 3 s (con SIGTERM en t0 + 2,7 s, al menos los dos primeros).
     while !cuadro.exists() {
-        assert!(inicio.elapsed() < Duration::from_secs(3), "no apareció el primer cuadro");
+        assert!(inicio.elapsed() < Duration::from_secs(10), "no apareció el primer cuadro");
         assert!(proceso.0.as_mut().unwrap().try_wait().unwrap().is_none(), "ffmpeg terminó antes de tiempo");
         sleep(Duration::from_millis(10));
     }
-    sleep(Duration::from_millis(1500).saturating_sub(inicio.elapsed()));
+    let t0 = Instant::now();
+    sleep(Duration::from_millis(500));
     fs::remove_dir_all(&carpeta).expect("borrar la carpeta de cuadros");
 
     if let Some(momento) = parar_a {
-        sleep(momento.saturating_sub(inicio.elapsed()));
+        sleep(momento.saturating_sub(t0.elapsed()));
         let pid = proceso.0.as_ref().unwrap().id().to_string();
         // `nice` hace exec de ffmpeg: el pid es el de ffmpeg.
         let ok = Command::new("kill").args(["-TERM", &pid]).status().expect("correr kill").success();
@@ -355,7 +359,7 @@ fn si_la_salida_de_cuadros_falla_kick_sigue_entera() {
 #[test]
 fn con_la_salida_de_cuadros_rota_sigterm_sale_con_255() {
     let _turno = UNO_POR_VEZ.lock().unwrap_or_else(|e| e.into_inner());
-    let (salida, cuadros) = kick_con_la_salida_de_cuadros_rota("sigterm", Some(Duration::from_millis(2500)));
+    let (salida, cuadros) = kick_con_la_salida_de_cuadros_rota("sigterm", Some(Duration::from_millis(2700)));
     assert_eq!(
         salida.status.code(),
         Some(255),

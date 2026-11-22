@@ -40,9 +40,11 @@
 #   salto de marcas duplica o descarta cuadros). Además no lleva comas ni barras que escapar acá.
 # - -fps_mode passthrough: la salida vigía no duplica ni descarta cuadros por su cuenta.
 # - image2 con update=1 y atomic_writing=1: pisa siempre el mismo archivo, escribiendo a
-#   cuadro.ppm.tmp y renombrando, así nunca se lee un cuadro a medias.
-# - tee con onfail=ignore: si falla la escritura del cuadro (carpeta borrada, tmpfs lleno), se cae
-#   solo esa salida y Kick sigue. El esclavo [f=null]- (no escribe nada y nunca falla) es necesario:
+#   cuadro.ppm.tmp y renombrando, así nunca se lee un cuadro a medio escribir.
+# - tee con onfail=ignore: si no se puede abrir el cuadro (carpeta borrada), se cae solo esa salida y
+#   Kick sigue. Con el tmpfs lleno, image2 de 6.1 probablemente no falla: puede renombrar un
+#   cuadro.ppm truncado, que el lector descarta por tamaño (no mide 15 + 960·540·3 bytes).
+#   El esclavo [f=null]- (no escribe nada y nunca falla) es necesario:
 #   con un solo esclavo, ffmpeg 6.1.1 ignora onfail ("All tee outputs failed."), la falla llega al
 #   muxer ("Error muxing a packet") y ffmpeg termina con 251 en vez de 0 (Kick sigue hasta el final,
 #   pero el error queda guardado). Con el null, sale con 0 al terminar la entrada y con 255 ante SIGTERM.
