@@ -17,6 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::cartel::Cartel;
 use crate::mux::{duracion_opus, partir_annexb, tipo_nal, Destino, Mux, CUADRO, HZ};
+use crate::sincronia::{Resumen, Sincronia};
 
 /// Largo del reloj de MPEG-TS: PTS y PCR son de 33 bits.
 const VUELTA_33: u64 = 1 << 33;
@@ -77,6 +78,11 @@ pub struct Salida<D: Destino> {
     dur_audio_ps5: u64,
     /// SPS y PPS de la PS5, para ponerlos delante de un keyframe que llegue sin ellos.
     parametros: Vec<u8>,
+    /// Registro del desfase de las marcas de la PS5 contra el reloj y de sus huecos (solo mira).
+    sincronia: Sincronia,
+    /// Los resúmenes de sincronía que salieron al registro, para los tests.
+    #[cfg(test)]
+    registrados: Vec<String>,
 }
 
 impl<D: Destino> Salida<D> {
@@ -93,11 +99,24 @@ impl<D: Destino> Salida<D> {
             a_sig: 0,
             dur_audio_ps5: 480 * HZ / 48_000,
             parametros: Vec::new(),
+            sincronia: Sincronia::new(),
+            #[cfg(test)]
+            registrados: Vec::new(),
         }
     }
 
     pub fn destino(&self) -> &D {
         self.mux.destino()
+    }
+
+    #[cfg(test)]
+    fn sincronia(&self) -> &Sincronia {
+        &self.sincronia
+    }
+
+    #[cfg(test)]
+    fn registrados(&self) -> &[String] {
+        &self.registrados
     }
 
     /// Marca de 90 kHz para un instante (desde el arranque de la salida).
@@ -114,6 +133,17 @@ impl<D: Destino> Salida<D> {
     fn a_cartel(&mut self, ahora: Duration) {
         let base = self.marcas(ahora).max(self.v_sig).max(self.a_sig);
         self.modo = Modo::Cartel { base, v: 0, a: 0 };
+        // Lo de los últimos segundos antes de volver al cartel es lo que más sirve para diagnosticar.
+        if let Some(resumen) = self.sincronia.cerrar_ya(ahora) {
+            self.registrar(resumen);
+        }
+        self.sincronia.olvidar();
+    }
+
+    fn registrar(&mut self, resumen: Resumen) {
+        crate::info!("{resumen}");
+        #[cfg(test)]
+        self.registrados.push(resumen.to_string());
     }
 
     fn proximas_del_cartel(&self, base: u64, v: u64, a: u64) -> (u64, u64) {
@@ -222,6 +252,10 @@ impl<D: Destino> Salida<D> {
         if let Err(e) = self.mux.video(&datos, pts, clave) {
             crate::falla!("salida: no pude escribir un cuadro de la PS5: {e}");
         }
+        self.sincronia.video(pts as i64 - reloj as i64, ahora);
+        if let Some(resumen) = self.sincronia.cerrar(ahora) {
+            self.registrar(resumen);
+        }
     }
 
     pub fn audio_ps5(&mut self, opus: &[u8], ahora: Duration) {
@@ -244,6 +278,7 @@ impl<D: Destino> Salida<D> {
         if let Err(e) = self.mux.audio(opus, pts) {
             crate::falla!("salida: no pude escribir audio de la PS5: {e}");
         }
+        self.sincronia.audio(pts as i64 - reloj as i64, ahora);
     }
 
     pub fn formato_audio(&mut self, frecuencia: u32, muestras_por_paquete: u32) {
@@ -532,6 +567,71 @@ pub mod tests {
         assert!(s.en_cartel(), "a los 1,5 s sin video vuelve al cartel");
         let v = videos(&s);
         assert_eq!(v.last().unwrap().1, Fuente::Cartel);
+    }
+
+    /// Documenta lo que hace hoy `ajustar` (no lo cambia): tras un hueco de audio de la PS5 de 300 ms,
+    /// la cuenta del audio sigue de largo y se corrige solo un 1 % por paquete, así que queda atrás.
+    #[test]
+    fn un_hueco_de_audio_de_300_ms_deja_el_audio_atrasado() {
+        let s = ps5_con_hueco_de_audio(3_000);
+        assert!(!s.en_cartel());
+        let minimo = s.sincronia().audio_minimo().expect("la salida registró el audio");
+        assert!(minimo <= -250 * 90, "desfase de audio mínimo: {} ms", minimo / 90);
+        let a: Vec<u64> = audios(&s).iter().map(|x| x.0).collect();
+        assert!(crecientes(&a), "las marcas de audio no retroceden");
+    }
+
+    /// La PS5 desde los 10 ms hasta `hasta_ms`: video cada 16,667 ms y audio de 20 ms (TOC 0xFC) cada
+    /// 20 ms, salvo de 1 s a 1,3 s, que no llega audio.
+    fn ps5_con_hueco_de_audio(hasta_ms: u64) -> Salida<Vec<u8>> {
+        let us = Duration::from_micros;
+        let mut s = Salida::new(cartel_de_prueba(), Vec::new(), ORIGEN_PRUEBA);
+        s.tick(ms(0));
+        s.video_ps5(&idr_ps5(0), 0, ms(10));
+        let (mut tv, mut ta) = (10_000u64, 10_000u64);
+        while tv < hasta_ms * 1_000 {
+            if ta <= tv {
+                if !(1_000_000..1_300_000).contains(&ta) {
+                    s.audio_ps5(&[0xFC, 0x50], us(ta));
+                }
+                ta += 20_000;
+            } else {
+                tv += 16_667;
+                s.tick(us(tv));
+                s.video_ps5(&p_ps5((tv / 16_667 % 200) as u8), 0, us(tv));
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn a_los_10_s_la_salida_cierra_la_ventana_y_registra_el_resumen() {
+        let s = ps5_con_hueco_de_audio(10_500);
+        assert!(!s.en_cartel());
+        let desde = s.sincronia().desde().expect("ventana nueva");
+        assert!(desde >= Duration::from_secs(10), "la ventana se cerró y volvió a empezar: {desde:?}");
+        assert_eq!(s.registrados().len(), 1, "{:?}", s.registrados());
+        let r = &s.registrados()[0];
+        assert!(r.starts_with("salida: últimos 10 s: video "), "{r}");
+        assert!(r.contains("de audio 3"), "el hueco de audio de ~320 ms: {r}");
+    }
+
+    #[test]
+    fn al_volver_al_cartel_registra_la_ventana_parcial_y_la_vacia() {
+        let mut s = ps5_con_hueco_de_audio(3_000);
+        assert!(s.registrados().is_empty(), "todavía no pasaron 10 s");
+        // La PS5 calla: a los 1,5 s sin video vuelve el cartel.
+        ticks(&mut s, 3_000, 4_600);
+        assert!(s.en_cartel());
+        assert_eq!(s.registrados().len(), 1, "{:?}", s.registrados());
+        let r = &s.registrados()[0];
+        assert!(r.starts_with("salida: últimos 5 s: video "), "~4,5 s de ventana parcial: {r}");
+        assert!(r.contains("audio -2"), "el audio quedó ~290 ms atrás: {r}");
+        assert_eq!(s.sincronia().desde(), None, "la sincronía quedó vacía");
+        assert_eq!(s.sincronia().audio_minimo(), None);
+        // Con el cartel no se registra nada más.
+        ticks(&mut s, 4_600, 6_000);
+        assert_eq!(s.registrados().len(), 1);
     }
 
     #[test]
