@@ -563,7 +563,12 @@ async fn salud<S: SesionPs5>(State(e): State<Compartido<S>>) -> Json<VideoSalud>
             let ahora_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_millis() as u64);
-            tokio::task::spawn_blocking(move || crate::vigia::leer_vigia(&ruta, ahora_ms)).await.ok().flatten()
+            // La salud no puede trabarse: si la lectura tarda (montaje colgado), se da `null`.
+            let lectura = tokio::task::spawn_blocking(move || crate::vigia::leer_vigia(&ruta, ahora_ms));
+            match tokio::time::timeout(std::time::Duration::from_millis(500), lectura).await {
+                Ok(r) => r.ok().flatten(),
+                Err(_) => None,
+            }
         }
         None => None,
     };

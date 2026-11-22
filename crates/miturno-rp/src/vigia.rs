@@ -46,16 +46,28 @@ fn clase_valida(c: &str) -> bool {
     (1..=32).contains(&c.len()) && c.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
 }
 
-/// Lee `ruta` y devuelve el veredicto con su edad (`ahora_ms − ts`, saturada en 0). Síncrona y rápida:
-/// el `stat` previo descarta lo que no es un archivo común (un FIFO bloquearía el `open`) y la lectura
-/// tiene tope, así que no se cuelga; desde el servidor se llama con `spawn_blocking`.
+/// `O_NONBLOCK` de Linux (igual en todas las arquitecturas): el `open` de un FIFO sin escritor no se
+/// cuelga. Sin `libc` como dependencia, los valores se fijan acá y un test los ata al comportamiento.
+const O_NONBLOCK: i32 = 0o4000;
+/// `O_NOFOLLOW` de Linux: 0o400000 salvo en arm/aarch64, donde vale 0o100000.
+#[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
+const O_NOFOLLOW: i32 = 0o100000;
+#[cfg(not(any(target_arch = "aarch64", target_arch = "arm")))]
+const O_NOFOLLOW: i32 = 0o400000;
+
+/// Lee `ruta` y devuelve el veredicto con su edad (`ahora_ms − ts`, saturada en 0). Síncrona: abre con
+/// `O_NONBLOCK | O_NOFOLLOW` (un FIFO o un enlace no cuelgan ni se siguen) y recién con el archivo abierto
+/// chequea con `fstat` que sea común y de a lo sumo 4 KiB, así que no hay carrera entre el chequeo y la
+/// lectura; la lectura tiene tope. Desde el servidor se llama con `spawn_blocking` y un timeout.
 pub fn leer_vigia(ruta: &Path, ahora_ms: u64) -> Option<SaludVigia> {
-    let meta = std::fs::metadata(ruta).ok()?;
+    use std::os::unix::fs::OpenOptionsExt;
+    let archivo = std::fs::OpenOptions::new().read(true).custom_flags(O_NONBLOCK | O_NOFOLLOW).open(ruta).ok()?;
+    let meta = archivo.metadata().ok()?;
     if !meta.is_file() || meta.len() > MAX_BYTES {
         return None;
     }
     let mut buf = Vec::new();
-    std::fs::File::open(ruta).ok()?.take(MAX_BYTES + 1).read_to_end(&mut buf).ok()?;
+    archivo.take(MAX_BYTES + 1).read_to_end(&mut buf).ok()?;
     if buf.len() as u64 > MAX_BYTES {
         return None;
     }
@@ -135,17 +147,53 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    #[test]
-    fn un_fifo_da_none_sin_bloquear() {
-        let dir = std::env::temp_dir().join(format!("vigia-test-{}-fifo", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let ruta = dir.join("estado.json");
+    fn mkfifo(ruta: &Path) {
         let c = std::ffi::CString::new(ruta.to_str().unwrap()).unwrap();
         extern "C" {
             fn mkfifo(path: *const std::ffi::c_char, mode: u32) -> i32;
         }
         assert_eq!(unsafe { mkfifo(c.as_ptr(), 0o600) }, 0);
-        assert_eq!(leer_vigia(&ruta, AHORA), None);
+    }
+
+    #[test]
+    fn un_fifo_da_none_sin_bloquear() {
+        let dir = std::env::temp_dir().join(format!("vigia-test-{}-fifo", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ruta = dir.join("estado.json");
+        mkfifo(&ruta);
+        // En un hilo aparte: si el `open` se colgara, el test falla por timeout en vez de colgarse.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let r2 = ruta.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(leer_vigia(&r2, AHORA));
+        });
+        let r = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("leer_vigia se colgó con un FIFO");
+        assert_eq!(r, None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn las_constantes_de_apertura_hacen_lo_que_dicen() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!("vigia-test-{}-flags", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // O_NONBLOCK: abrir un FIFO sin escritor vuelve en el acto (sin la bandera se bloquea).
+        let fifo = dir.join("fifo");
+        mkfifo(&fifo);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let f2 = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(std::fs::OpenOptions::new().read(true).custom_flags(O_NONBLOCK).open(&f2).is_ok());
+        });
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)), Ok(true));
+        // O_NOFOLLOW: un enlace simbólico no se abre.
+        let real = dir.join("real.json");
+        std::fs::write(&real, VALIDO).unwrap();
+        let enlace = dir.join("enlace.json");
+        std::os::unix::fs::symlink(&real, &enlace).unwrap();
+        assert!(std::fs::OpenOptions::new().read(true).custom_flags(O_NOFOLLOW).open(&enlace).is_err());
+        assert!(std::fs::OpenOptions::new().read(true).custom_flags(O_NOFOLLOW).open(&real).is_ok());
+        assert_eq!(leer_vigia(&enlace, AHORA), None);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -160,6 +208,7 @@ mod tests {
             ("clase_vacia", VALIDO.replace("store", "")),
             ("clase_larga", VALIDO.replace("store", &"a".repeat(33))),
             ("de_mas", VALIDO.replace("}", r#","otro":1}"#)),
+            ("sin_desde", VALIDO.replace(r#","desde":1795299997000"#, "")),
             ("sin_seguro", VALIDO.replace(r#""seguro":true,"#, "")),
         ];
         for (nombre, t) in casos {
