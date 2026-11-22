@@ -14,11 +14,19 @@ pub const RUTA_PS5: &str = "/etc/miturno-video/ps5.env";
 /// Dónde se guarda la pausa del ciclo (`StateDirectory=miturno-rp` de la unidad).
 pub const RUTA_PAUSA: &str = "/var/lib/miturno-rp/pausa";
 
+/// Dónde se guarda el registro de sesiones WHEP abiertas (`StateDirectory=miturno-rp`), para expulsarlas
+/// aunque miturno-rp se reinicie (`servidor::whep`).
+pub const RUTA_SESIONES_WHEP: &str = "/var/lib/miturno-rp/whep.json";
+
+fn ruta_sesiones_whep() -> PathBuf {
+    RUTA_SESIONES_WHEP.into()
+}
+
 fn ruta_pausa() -> PathBuf {
     RUTA_PAUSA.into()
 }
 
-/// `rp.toml`. Todos los campos son obligatorios salvo `pausa`: la instalación (Task 6) los escribe explícitos.
+/// `rp.toml`. Todos los campos son obligatorios salvo `pausa` y `sesiones_whep`: la instalación (Task 6) los escribe explícitos.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -37,6 +45,10 @@ pub struct Config {
     /// (`crate::pausa`). Por defecto, `RUTA_PAUSA`.
     #[serde(default = "ruta_pausa")]
     pub pausa: PathBuf,
+    /// Registro de las sesiones WHEP abiertas (sin secretos), para que un reinicio no deje sin
+    /// expulsar a quien ya no corresponde. Por defecto, `RUTA_SESIONES_WHEP`.
+    #[serde(default = "ruta_sesiones_whep")]
+    pub sesiones_whep: PathBuf,
 }
 
 /// Todo lo que hace falta para despertar la PS5 y abrir una sesión.
@@ -284,8 +296,17 @@ pausa = "/var/lib/miturno-rp/pausa"
                 clave_publica: r("/etc/miturno-video/ct-public.pem"),
                 token_control: r("/etc/miturno-video/control.token"),
                 pausa: r("/var/lib/miturno-rp/pausa"),
+                sesiones_whep: r(RUTA_SESIONES_WHEP),
             }
         );
+    }
+
+    #[test]
+    fn el_registro_de_sesiones_whep_va_en_el_state_directory_y_se_puede_cambiar() {
+        assert_eq!(RUTA_SESIONES_WHEP, "/var/lib/miturno-rp/whep.json");
+        assert_eq!(parsear_config(TOML, &r("rp.toml")).unwrap().sesiones_whep, r(RUTA_SESIONES_WHEP));
+        let otra = format!("{TOML}sesiones_whep = \"/srv/whep.json\"\n");
+        assert_eq!(parsear_config(&otra, &r("rp.toml")).unwrap().sesiones_whep, r("/srv/whep.json"));
     }
 
     #[test]

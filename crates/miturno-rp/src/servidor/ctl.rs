@@ -72,6 +72,9 @@ const PLAZO_ENVIO: Duration = Duration::from_secs(1);
 /// Los rechazos de `/ctl` por turno (`TURNO`) o por rol (`ROL`): uno por minuto en el registro.
 pub(super) static RECHAZO_MANDOS: crate::registro::Limitado = crate::registro::Limitado::new();
 
+/// Los rechazos `OCUPADO` de `/ctl`: uno por minuto en el registro.
+pub(super) static RECHAZO_OCUPADO: crate::registro::Limitado = crate::registro::Limitado::new();
+
 /// Por qué una conexión pierde la ranura (el aviso que recibe).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Expulsion {
@@ -105,7 +108,7 @@ impl Ocupante {
 /// Lo que protege el mismo candado: quién controla, quién puede controlar o ver, la actividad del
 /// jugador y las sesiones WHEP abiertas. Con el mismo candado, un WHEP que se autoriza con el turno
 /// viejo no puede registrarse después de que `/control/turno` calculó a quién expulsar.
-/// Al arrancar no hay nadie autorizado, ni actividad, ni sesiones (nada se guarda en disco).
+/// Al arrancar no hay nadie autorizado ni actividad; las sesiones WHEP vienen del registro guardado.
 pub(super) struct Ranura {
     pub(super) ocupante: Option<Ocupante>,
     autorizados: Autorizados,
@@ -114,13 +117,8 @@ pub(super) struct Ranura {
 }
 
 impl Ranura {
-    pub(super) fn new() -> Self {
-        Self {
-            ocupante: None,
-            autorizados: Autorizados::vacio(),
-            actividad: Actividad::new(),
-            whep: SesionesWhep::default(),
-        }
+    pub(super) fn new(whep: SesionesWhep) -> Self {
+        Self { ocupante: None, autorizados: Autorizados::vacio(), actividad: Actividad::new(), whep }
     }
 }
 
@@ -335,13 +333,38 @@ impl<S: SesionPs5> EstadoServidor<S> {
             if !r.autorizados.video(c.rol, &c.sub, c.turn_id.as_deref()) {
                 return None;
             }
-            Some(id.map(|id| r.whep.registrar(id, c.rol, &c.sub, c.turn_id.as_deref())).unwrap_or_default())
+            let expulsar = id.map(|id| r.whep.registrar(id, c.rol, &c.sub, c.turn_id.as_deref())).unwrap_or_default();
+            self.guardar_whep(r);
+            Some(expulsar)
         })
     }
 
     /// Saca del registro una sesión WHEP ya expulsada.
     pub(super) fn quitar_whep(&self, id: &str) {
-        self.con_ranura(|r| r.whep.quitar(id));
+        self.con_ranura(|r| {
+            r.whep.quitar(id);
+            self.guardar_whep(r);
+        });
+    }
+
+    /// La expulsión de esa sesión falló del todo: queda para el próximo intento.
+    pub(super) fn fallida_whep(&self, id: &str) {
+        self.con_ranura(|r| r.whep.fallida(id));
+    }
+
+    /// Pasa la versión actual del registro al que lo guarda en disco (solo si cambió; lo pendiente no
+    /// cuenta). La escritura es fuera del candado.
+    fn guardar_whep(&self, r: &Ranura) {
+        if let Some(tx) = &self.guardar_whep {
+            let json = r.whep.a_json();
+            tx.send_if_modified(|v| {
+                let cambio = *v != json;
+                if cambio {
+                    *v = json;
+                }
+                cambio
+            });
+        }
     }
 
     /// `VideoSalud.jugador`: el turno vigente guardado, quién controla y la inactividad del jugador.
@@ -481,9 +504,10 @@ async fn conexion<S: SesionPs5>(e: Arc<EstadoServidor<S>>, mut socket: WebSocket
         Ok(t) => t,
         Err(codigo) => {
             // `TURNO` y `ROL` los puede provocar cualquiera con una credencial válida (también se
-            // esperan en la carrera del arranque del turno): limitados, como la credencial rechazada.
+            // esperan en la carrera del arranque del turno) y `OCUPADO`, el jugador que reintenta con el
+            // operador al mando: limitados, como la credencial rechazada (cada uno con su límite).
             if codigo == "OCUPADO" {
-                crate::info!("ctl: conexión {id} (rol={}) rechazada ({codigo})", nombre_rol(cred.rol));
+                crate::limitado!(6, RECHAZO_OCUPADO, "ctl: conexión {id} (rol={}) rechazada ({codigo})", nombre_rol(cred.rol));
             } else {
                 crate::limitado!(6, RECHAZO_MANDOS, "ctl: conexión {id} (rol={}) rechazada ({codigo})", nombre_rol(cred.rol));
             }

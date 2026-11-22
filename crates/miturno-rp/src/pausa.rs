@@ -80,17 +80,21 @@ pub fn leer(ruta: &Path) -> Result<Option<Pausa>, ErrorPausa> {
     std::str::from_utf8(&buf).ok().and_then(parsear).map(Some).ok_or(ErrorPausa::Corrupta)
 }
 
-/// Escribe la pausa de forma atómica: temporal en el mismo directorio, `fsync`, `rename` y `fsync`
-/// del directorio.
+/// Escribe la pausa de forma atómica (`escribir_atomico`).
 pub fn guardar(ruta: &Path, pausa: Pausa) -> std::io::Result<()> {
+    escribir_atomico(ruta, format!("{}\n", pausa.texto()).as_bytes())
+}
+
+/// Escribe un archivo de estado de forma atómica: temporal en el mismo directorio, `fsync`, `rename`
+/// y `fsync` del directorio. Nunca queda a medias. También lo usa el registro de sesiones WHEP.
+pub fn escribir_atomico(ruta: &Path, datos: &[u8]) -> std::io::Result<()> {
     let dir = ruta.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let mut nombre = ruta.file_name().unwrap_or_default().to_os_string();
     nombre.push(".tmp");
     let temporal = dir.join(nombre);
     let escribir = || -> std::io::Result<()> {
         let mut f = std::fs::File::create(&temporal)?;
-        f.write_all(pausa.texto().as_bytes())?;
-        f.write_all(b"\n")?;
+        f.write_all(datos)?;
         f.sync_all()?;
         std::fs::rename(&temporal, ruta)?;
         std::fs::File::open(dir)?.sync_all()

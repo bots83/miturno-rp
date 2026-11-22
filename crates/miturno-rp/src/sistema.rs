@@ -83,30 +83,58 @@ impl Sistema for SistemaReal {
     }
 }
 
-/// `POST <api>/v3/webrtcsessions/kick/<id>` con `curl` (sin shell, como el `runOnRead` de MediaMTX).
-/// `200` es expulsada y `404`, que ya no estaba; cualquier otra cosa es un error.
+/// Tope de lo que se lee de la respuesta de la API (cuerpo y código).
+const MAX_RESPUESTA: usize = 4 * 1024;
+
+/// La respuesta de `curl -w '\n%{http_code}'`: el cuerpo y, en la última línea, el código. `200` es
+/// expulsada. `404` solo si es el `APIError` de MediaMTX v1.21.3 para una sesión que no existe
+/// (`{"status":"error","error":"session not found"}`, `internal/api/api.go` `writeError` con
+/// `webrtc.ErrSessionNotFound`): otro 404 (por ejemplo el "404 page not found" de gin si la ruta no
+/// existe) es un error, así nunca se da por expulsada una sesión que sigue viendo.
+pub fn resultado_kick(salida: &str) -> Result<(), String> {
+    #[derive(serde::Deserialize)]
+    struct ErrorApi {
+        status: String,
+        error: String,
+    }
+    let (cuerpo, codigo) = salida.rsplit_once('\n').ok_or("curl no devolvió el código HTTP")?;
+    match codigo.trim() {
+        "200" => Ok(()),
+        "404" => match serde_json::from_str::<ErrorApi>(cuerpo) {
+            Ok(e) if e.status == "error" && e.error == "session not found" => Ok(()),
+            _ => Err("la API de MediaMTX respondió 404 sin ser el de una sesión inexistente (¿cambió la ruta?)".into()),
+        },
+        otro => Err(format!("la API de MediaMTX respondió {otro}")),
+    }
+}
+
+/// Los argumentos de `curl`: `-q` primero (no lee `~/.curlrc`), sin proxy, el cuerpo y el código
+/// por la salida estándar, y como mucho 2 s.
+pub fn argumentos_curl(url: &str) -> Vec<String> {
+    ["-q", "-s", "--noproxy", "*", "-w", "\n%{http_code}", "--max-time", "2", "-X", "POST", url]
+        .map(String::from)
+        .to_vec()
+}
+
+/// `POST <api>/v3/webrtc/sessions/kick/<id>` (la ruta vigente de la v1.21.3; `/v3/webrtcsessions/…`
+/// está marcada como vieja) con `curl`, sin shell, como el `runOnRead` de MediaMTX. Ver `resultado_kick`.
 /// El `id` se vuelve a validar acá (el registro ya solo guarda UUID): nada raro llega a la URL.
 pub async fn expulsar_con_curl(api: &str, id: &str) -> Result<(), String> {
     if !crate::servidor::whep::es_uuid(id) {
         return Err("el id de la sesión no es un UUID".into());
     }
-    let url = format!("{api}/v3/webrtcsessions/kick/{id}");
+    let url = format!("{api}/v3/webrtc/sessions/kick/{id}");
     let salida = tokio::time::timeout(
         PLAZO_CURL,
-        tokio::process::Command::new("curl")
-            .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "2", "-X", "POST", &url])
-            .kill_on_drop(true)
-            .output(),
+        tokio::process::Command::new("curl").args(argumentos_curl(&url)).kill_on_drop(true).output(),
     )
     .await;
     match salida {
         Err(_) => Err(format!("curl no terminó en {} s", PLAZO_CURL.as_secs())),
         Ok(Err(e)) => Err(format!("curl: {e}")),
         Ok(Ok(o)) if !o.status.success() => Err(format!("curl: {}", o.status)),
-        Ok(Ok(o)) => match String::from_utf8_lossy(&o.stdout).trim() {
-            "200" | "404" => Ok(()),
-            codigo => Err(format!("la API de MediaMTX respondió {codigo}")),
-        },
+        Ok(Ok(o)) if o.stdout.len() > MAX_RESPUESTA => Err("la API de MediaMTX respondió demasiado".into()),
+        Ok(Ok(o)) => resultado_kick(&String::from_utf8_lossy(&o.stdout)),
     }
 }
 
@@ -146,18 +174,27 @@ mod tests {
     use axum::http::{Method, StatusCode, Uri};
     use std::sync::{Arc, Mutex};
 
-    /// API de MediaMTX falsa en un puerto libre de 127.0.0.1: contesta lo que dice `respuesta` según el
-    /// id, y anota (método, ruta) de cada pedido.
-    async fn api_falsa(respuesta: fn(&str) -> StatusCode) -> (String, Arc<Mutex<Vec<(Method, String)>>>) {
+    /// API de MediaMTX falsa en un puerto libre de 127.0.0.1. Como la v1.21.3: `POST
+    /// /v3/webrtc/sessions/kick/<id>` contesta `{"status":"ok"}`, o el `APIError` en JSON con 404 si la
+    /// sesión no existe (`…0404`) y con 500 (`…0500`); cualquier otra ruta es el 404 de texto de gin.
+    /// Anota (método, ruta) de cada pedido.
+    async fn api_falsa() -> (String, Arc<Mutex<Vec<(Method, String)>>>) {
         let pedidos = Arc::new(Mutex::new(Vec::new()));
         let p = pedidos.clone();
         let app = axum::Router::new().fallback(move |metodo: Method, uri: Uri| {
             let p = p.clone();
             async move {
                 p.lock().unwrap().push((metodo.clone(), uri.path().to_string()));
-                match uri.path().strip_prefix("/v3/webrtcsessions/kick/") {
-                    Some(id) if metodo == Method::POST => respuesta(id),
-                    _ => StatusCode::METHOD_NOT_ALLOWED,
+                let json = |st: StatusCode, cuerpo: &'static str| (st, [("content-type", "application/json")], cuerpo);
+                match uri.path().strip_prefix("/v3/webrtc/sessions/kick/") {
+                    Some(id) if metodo == Method::POST && id.ends_with("0404") => {
+                        json(StatusCode::NOT_FOUND, r#"{"status":"error","error":"session not found"}"#)
+                    }
+                    Some(id) if metodo == Method::POST && id.ends_with("0500") => {
+                        json(StatusCode::INTERNAL_SERVER_ERROR, r#"{"status":"error","error":"terminated"}"#)
+                    }
+                    Some(_) if metodo == Method::POST => json(StatusCode::OK, r#"{"status":"ok"}"#),
+                    _ => (StatusCode::NOT_FOUND, [("content-type", "text/plain")], "404 page not found"),
                 }
             }
         });
@@ -170,23 +207,58 @@ mod tests {
     const ID: &str = "0f8e7d6c-5b4a-4321-8fed-cba987654321";
 
     #[tokio::test]
-    async fn expulsar_con_curl_hace_el_post_del_kick_y_toma_200_y_404_como_expulsada() {
-        let (api, pedidos) = api_falsa(|id| match id {
-            "0f8e7d6c-5b4a-4321-8fed-cba987654321" => StatusCode::OK,
-            "00000000-0000-4000-8000-000000000404" => StatusCode::NOT_FOUND,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        })
-        .await;
+    async fn expulsar_con_curl_hace_el_post_a_la_ruta_vigente_y_toma_el_404_de_sesion_como_expulsada() {
+        let (api, pedidos) = api_falsa().await;
         assert_eq!(expulsar_con_curl(&api, ID).await, Ok(()));
         assert_eq!(expulsar_con_curl(&api, "00000000-0000-4000-8000-000000000404").await, Ok(()), "ya no estaba");
         let error = expulsar_con_curl(&api, "00000000-0000-4000-8000-000000000500").await;
         assert!(error.as_ref().is_err_and(|m| m.contains("500")), "{error:?}");
         assert_eq!(
             pedidos.lock().unwrap()[0],
-            (Method::POST, format!("/v3/webrtcsessions/kick/{ID}")),
-            "un solo POST a la ruta del kick"
+            (Method::POST, format!("/v3/webrtc/sessions/kick/{ID}")),
+            "un solo POST a la ruta vigente (la de /v3/webrtcsessions es la vieja)"
         );
         assert_eq!(pedidos.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn expulsar_con_curl_un_404_que_no_es_el_de_sesion_inexistente_es_un_error() {
+        // Si la ruta desaparece (otra versión de MediaMTX), gin contesta "404 page not found": tomarlo
+        // como expulsada dejaría la sesión viendo video.
+        let (api, pedidos) = api_falsa().await;
+        let error = expulsar_con_curl(&format!("{api}/otra-cosa"), ID).await;
+        assert!(error.as_ref().is_err_and(|m| m.contains("404")), "{error:?}");
+        assert_eq!(pedidos.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn la_respuesta_del_kick() {
+        assert_eq!(resultado_kick("{\"status\":\"ok\"}\n200"), Ok(()));
+        assert_eq!(resultado_kick("{\"status\":\"error\",\"error\":\"session not found\"}\n404"), Ok(()));
+        assert_eq!(resultado_kick("{\"error\":\"session not found\",\"status\":\"error\"}\n404"), Ok(()), "el orden de las claves no importa");
+        for mal in [
+            "404 page not found\n404",
+            "{\"status\":\"error\",\"error\":\"path not found\"}\n404",
+            "{\"status\":\"ok\",\"error\":\"session not found\"}\n404",
+            "\n404",
+            "{\"status\":\"error\",\"error\":\"session not found\"}\n500",
+            "\n401",
+            "\n000",
+            "",
+            "200",
+        ] {
+            assert!(resultado_kick(mal).is_err(), "{mal:?}");
+        }
+    }
+
+    #[test]
+    fn curl_sin_curlrc_ni_proxy() {
+        let a = argumentos_curl("http://127.0.0.1:9997/v3/webrtc/sessions/kick/x");
+        assert_eq!(a[0], "-q", "-q tiene que ser el primero para que no lea ~/.curlrc");
+        assert!(a.windows(2).any(|w| w == ["--noproxy", "*"]), "{a:?}");
+        assert!(a.windows(2).any(|w| w == ["--max-time", "2"]), "{a:?}");
+        assert!(a.windows(2).any(|w| w == ["-X", "POST"]), "{a:?}");
+        assert_eq!(a.last().map(String::as_str), Some("http://127.0.0.1:9997/v3/webrtc/sessions/kick/x"));
     }
 
     #[tokio::test]
@@ -200,7 +272,7 @@ mod tests {
 
     #[tokio::test]
     async fn expulsar_con_curl_no_lanza_nada_con_un_id_que_no_es_uuid() {
-        let (api, pedidos) = api_falsa(|_| StatusCode::OK).await;
+        let (api, pedidos) = api_falsa().await;
         assert!(expulsar_con_curl(&api, "x/../../v3/config").await.is_err());
         assert!(pedidos.lock().unwrap().is_empty());
     }

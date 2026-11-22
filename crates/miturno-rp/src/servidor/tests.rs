@@ -112,9 +112,14 @@ struct SistemaFalso {
     llamadas: Mutex<Vec<(String, String)>>,
     falla_systemctl: Mutex<bool>,
     cpu: Mutex<VecDeque<TiemposCpu>>,
-    /// Cada `expulsar_whep` pedido (también los que fallan), en orden.
-    expulsiones: Mutex<Vec<String>>,
-    falla_expulsion: Mutex<bool>,
+    /// Cada `expulsar_whep` pedido (también los que fallan), en orden y con la hora.
+    expulsiones: Mutex<Vec<(String, Instant)>>,
+    /// Cuántas de las próximas expulsiones fallan.
+    fallas: Mutex<u32>,
+    /// Lo que tarda cada expulsión (como un `curl` lento).
+    demora: Mutex<Duration>,
+    /// Expulsiones en curso ahora y el máximo que hubo a la vez.
+    en_vuelo: Arc<Mutex<(u32, u32)>>,
 }
 
 impl Sistema for SistemaFalso {
@@ -129,9 +134,28 @@ impl Sistema for SistemaFalso {
         Box::pin(std::future::ready(r))
     }
     fn expulsar_whep<'a>(&'a self, id: &'a str) -> Futuro<'a, Result<(), String>> {
-        self.expulsiones.lock().unwrap().push(id.into());
-        let r = if *self.falla_expulsion.lock().unwrap() { Err("la API de MediaMTX no contesta".into()) } else { Ok(()) };
-        Box::pin(std::future::ready(r))
+        self.expulsiones.lock().unwrap().push((id.into(), Instant::now()));
+        let r = {
+            let mut f = self.fallas.lock().unwrap();
+            if *f > 0 {
+                *f -= 1;
+                Err("la API de MediaMTX no contesta".to_string())
+            } else {
+                Ok(())
+            }
+        };
+        let demora = *self.demora.lock().unwrap();
+        let en_vuelo = self.en_vuelo.clone();
+        Box::pin(async move {
+            {
+                let mut v = en_vuelo.lock().unwrap();
+                v.0 += 1;
+                v.1 = v.1.max(v.0);
+            }
+            sleep(demora).await;
+            en_vuelo.lock().unwrap().0 -= 1;
+            r
+        })
     }
     fn tiempos_cpu(&self) -> Option<TiemposCpu> {
         let mut c = self.cpu.lock().unwrap();
@@ -160,6 +184,11 @@ async fn banco_con_turno() -> Banco {
 }
 
 fn banco() -> Banco {
+    banco_con(None)
+}
+
+/// Banco con el registro de sesiones WHEP guardado en `whep` (como el de `/var/lib/miturno-rp`).
+fn banco_con(whep: Option<std::path::PathBuf>) -> Banco {
     let sesion = Arc::new(ConLimite::new(SesionFalsa::new(), 3_000));
     let sistema = Arc::new(SistemaFalso::default());
     let (tx_ordenes, ordenes) = mpsc::channel(16);
@@ -172,6 +201,7 @@ fn banco() -> Banco {
         metricas: metricas.clone(),
         sistema: sistema.clone(),
         reloj_s: || AHORA,
+        sesiones_whep: whep,
     });
     let (conexiones, rx) = mpsc::channel(8);
     tokio::spawn(servir(Memoria(rx), estado.clone()));
@@ -276,7 +306,12 @@ impl Banco {
     /// Las expulsiones pedidas hasta ahora (después de dejar correr las tareas en segundo plano).
     async fn expulsiones(&self) -> Vec<String> {
         sleep(Duration::from_millis(5)).await;
-        self.sistema.expulsiones.lock().unwrap().clone()
+        self.sistema.expulsiones.lock().unwrap().iter().map(|(id, _)| id.clone()).collect()
+    }
+
+    /// Cuándo se pidió cada expulsión, en ms desde `t0`.
+    fn momentos_ms(&self, t0: Instant) -> Vec<u64> {
+        self.sistema.expulsiones.lock().unwrap().iter().map(|(_, t)| (*t - t0).as_millis() as u64).collect()
     }
 }
 
@@ -1058,19 +1093,129 @@ async fn whep_un_id_que_no_es_uuid_se_autoriza_pero_no_se_registra() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn whep_si_la_expulsion_falla_se_reintenta_en_el_proximo_empuje() {
+async fn whep_un_kick_fallido_se_reintenta_a_1_2_y_4_s() {
     let b = banco();
     b.empujar_con(1, Some(("u1", "t1")), &[]).await;
     let s = uuid(1);
     assert_eq!(b.ver(&token_jugador("u1", "t1"), Some(&s)).await, StatusCode::OK);
-    *b.sistema.falla_expulsion.lock().unwrap() = true;
+    *b.sistema.fallas.lock().unwrap() = 2;
+    let t0 = Instant::now();
     b.empujar_con(2, None, &[]).await;
-    assert_eq!(b.expulsiones().await, vec![s.clone()]);
-    *b.sistema.falla_expulsion.lock().unwrap() = false;
+    sleep(Duration::from_secs(20)).await;
+    assert_eq!(b.momentos_ms(t0), vec![0, 1_000, 3_000], "la tercera sale bien");
     b.empujar_con(3, None, &[]).await;
-    assert_eq!(b.expulsiones().await, vec![s.clone(), s.clone()], "sigue registrada: se reintenta");
+    assert_eq!(b.expulsiones().await.len(), 3, "expulsada: ya no se intenta");
+}
+
+#[tokio::test(start_paused = true)]
+async fn whep_si_fallan_los_4_intentos_se_reintenta_en_el_proximo_empuje() {
+    let b = banco();
+    b.empujar_con(1, Some(("u1", "t1")), &[]).await;
+    let s = uuid(1);
+    assert_eq!(b.ver(&token_jugador("u1", "t1"), Some(&s)).await, StatusCode::OK);
+    *b.sistema.fallas.lock().unwrap() = 4;
+    let t0 = Instant::now();
+    b.empujar_con(2, None, &[]).await;
+    sleep(Duration::from_secs(60)).await;
+    assert_eq!(b.momentos_ms(t0), vec![0, 1_000, 3_000, 7_000], "y después se deja para el próximo empuje");
+    b.empujar_con(3, None, &[]).await;
+    assert_eq!(b.expulsiones().await, vec![s.clone(); 5], "sigue registrada: se reintenta");
     b.empujar_con(4, None, &[]).await;
-    assert_eq!(b.expulsiones().await, vec![s.clone(), s], "expulsada: ya no se intenta");
+    assert_eq!(b.expulsiones().await, vec![s; 5], "expulsada: ya no se intenta");
+}
+
+#[tokio::test(start_paused = true)]
+async fn whep_muchas_pestanas_a_la_vez_no_multiplican_los_curl() {
+    // Cada WHEP de la misma cuenta pedía de nuevo las expulsiones que ya estaban en vuelo: N pestañas
+    // eran ~N²/2 procesos de curl. Cada sesión se expulsa una vez, y de a una.
+    let b = banco();
+    b.empujar_con(1, Some(("u1", "t1")), &[]).await;
+    *b.sistema.demora.lock().unwrap() = Duration::from_secs(2);
+    for n in 1..=8 {
+        assert_eq!(b.ver(&token_jugador("u1", "t1"), Some(&uuid(n))).await, StatusCode::OK);
+    }
+    sleep(Duration::from_secs(60)).await;
+    let mut ids = b.expulsiones().await;
+    ids.sort();
+    assert_eq!(ids, (1..=7).map(uuid).collect::<Vec<_>>(), "cada anterior, una sola vez");
+    assert_eq!(b.sistema.en_vuelo.lock().unwrap().1, 1, "un solo curl a la vez");
+    // Un empuje en medio de expulsiones lentas tampoco repite las que están en vuelo.
+    for n in 9..=10 {
+        assert_eq!(b.ver(&token_jugador("u1", "t1"), Some(&uuid(n))).await, StatusCode::OK);
+    }
+    b.empujar_con(2, None, &[]).await;
+    b.empujar_con(3, None, &[]).await;
+    sleep(Duration::from_secs(60)).await;
+    let mut ids = b.expulsiones().await;
+    ids.sort();
+    assert_eq!(ids, (1..=10).map(uuid).collect::<Vec<_>>());
+}
+
+#[tokio::test(start_paused = true)]
+async fn turno_responde_sin_esperar_a_la_expulsion() {
+    let b = banco();
+    b.empujar_con(1, Some(("u1", "t1")), &[]).await;
+    assert_eq!(b.ver(&token_jugador("u1", "t1"), Some(&uuid(1))).await, StatusCode::OK);
+    *b.sistema.demora.lock().unwrap() = Duration::from_secs(30);
+    let t = Instant::now();
+    b.empujar_con(2, None, &[]).await;
+    assert!(t.elapsed() < Duration::from_millis(100), "{:?}", t.elapsed());
+    assert_eq!(b.expulsiones().await, vec![uuid(1)], "la expulsión ya arrancó, en segundo plano");
+}
+
+/// Ruta para el registro de sesiones de un test (vacía: sin archivo).
+fn ruta_whep(nombre: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("miturno-rp-servidor-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join(nombre);
+    let _ = std::fs::remove_file(&p);
+    p
+}
+
+#[tokio::test(start_paused = true)]
+async fn whep_tras_un_reinicio_se_expulsan_las_que_ya_no_corresponden() {
+    let ruta = ruta_whep("whep-reinicio");
+    let b = banco_con(Some(ruta.clone()));
+    b.empujar_con(1, Some(("u1", "t1")), &["u2"]).await;
+    let (a, v, op) = (uuid(1), uuid(2), uuid(3));
+    assert_eq!(b.ver(&token_jugador("u1", "t1"), Some(&a)).await, StatusCode::OK);
+    assert_eq!(b.ver(&token_vista("u2"), Some(&v)).await, StatusCode::OK);
+    assert_eq!(b.ver(&token_operador("op"), Some(&op)).await, StatusCode::OK);
+    sleep(Duration::from_millis(50)).await;
+    let guardado = std::fs::read_to_string(&ruta).unwrap();
+    assert!(guardado.contains(&a) && guardado.contains(&v) && !guardado.contains(&op), "{guardado}");
+    drop(b);
+
+    // Reinicio: hasta el primer empuje no se sabe quién corresponde; no se expulsa a nadie.
+    let b = banco_con(Some(ruta.clone()));
+    sleep(Duration::from_secs(5)).await;
+    assert!(b.expulsiones().await.is_empty());
+    // u2 pasó a jugar con su credencial de vista abierta: la conserva. u1 ya no.
+    b.empujar_con(2, Some(("u2", "t2")), &[]).await;
+    assert_eq!(b.expulsiones().await, vec![a.clone()]);
+    sleep(Duration::from_millis(50)).await;
+    let guardado = std::fs::read_to_string(&ruta).unwrap();
+    assert!(!guardado.contains(&a) && guardado.contains(&v), "la expulsada sale del disco: {guardado}");
+    drop(b);
+
+    let b = banco_con(Some(ruta.clone()));
+    b.empujar_con(3, None, &[]).await;
+    assert_eq!(b.expulsiones().await, vec![v], "la del operador nunca");
+    let _ = std::fs::remove_file(&ruta);
+}
+
+#[tokio::test(start_paused = true)]
+async fn whep_un_registro_corrupto_se_descarta_y_se_arranca_vacio() {
+    let ruta = ruta_whep("whep-corrupto");
+    std::fs::write(&ruta, "esto no es el registro").unwrap();
+    let b = banco_con(Some(ruta.clone()));
+    assert!(!ruta.exists(), "el corrupto se borra");
+    b.empujar_con(1, Some(("u1", "t1")), &[]).await;
+    assert!(b.expulsiones().await.is_empty());
+    assert_eq!(b.ver(&token_jugador("u1", "t1"), Some(&uuid(1))).await, StatusCode::OK);
+    sleep(Duration::from_millis(50)).await;
+    assert!(std::fs::read_to_string(&ruta).unwrap().contains(&uuid(1)), "se vuelve a guardar");
+    let _ = std::fs::remove_file(&ruta);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1582,8 +1727,8 @@ async fn tras_un_reinicio_el_jugador_recibe_turno_hasta_el_empuje_y_despues_ok()
 }
 
 #[tokio::test(start_paused = true)]
-async fn ctl_los_rechazos_turno_y_rol_pasan_por_el_limitador() {
-    // /ctl es público: un rechazo por turno o por rol no puede llenar el journal (uno por minuto).
+async fn ctl_los_rechazos_turno_rol_y_ocupado_pasan_por_el_limitador() {
+    // /ctl es público: un rechazo por turno, rol u ocupado no puede llenar el journal (uno por minuto).
     use crate::registro::{ms_desde_arranque, CADA_RECHAZO_MS};
     let b = banco();
     for (t, codigo) in [(token_jugador("u1", "t1"), "TURNO"), (token_vista("u2"), "ROL")] {
@@ -1595,4 +1740,10 @@ async fn ctl_los_rechazos_turno_y_rol_pasan_por_el_limitador() {
             "{codigo}: el limitador ya registró un aviso en el último minuto"
         );
     }
+    b.empujar(1, Some(("u1", "t1"))).await;
+    let (_wo, r) = b.ws_con(&token("operador")).await;
+    assert_eq!(r, json!({"t":"ok","rol":"operador"}));
+    let (_, r) = b.ws_con(&token_jugador("u1", "t1")).await;
+    assert_eq!(r, json!({"t":"error","codigo":"OCUPADO"}));
+    assert_eq!(ctl::RECHAZO_OCUPADO.permitir(ms_desde_arranque(), CADA_RECHAZO_MS), None, "OCUPADO");
 }

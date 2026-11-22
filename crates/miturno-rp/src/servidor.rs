@@ -18,7 +18,8 @@ mod tests;
 pub(crate) mod whep;
 
 use std::net::{IpAddr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Weak;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -34,7 +35,7 @@ use rp_core::{leer_autorizados, validar_con, ClaveVerificacion, Credencial};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use subtle::ConstantTimeEq;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
 use crate::ciclo::Orden;
@@ -108,6 +109,9 @@ pub struct Piezas<S: SesionPs5> {
     pub sistema: Arc<dyn Sistema>,
     /// Hora de pared en segundos (inyectable para los tests).
     pub reloj_s: fn() -> u64,
+    /// Dónde se guarda el registro de sesiones WHEP (`sesiones_whep` de `rp.toml`). Sin ruta, vive solo
+    /// en memoria (tests).
+    pub sesiones_whep: Option<PathBuf>,
 }
 
 pub struct EstadoServidor<S: SesionPs5> {
@@ -129,29 +133,49 @@ pub struct EstadoServidor<S: SesionPs5> {
     cpu: Mutex<f64>,
     /// Toques descartados por el filtro, sumados de todas las conexiones terminadas.
     descartados: AtomicU64,
+    /// Las expulsiones WHEP pendientes: las hace de a una `trabajador_whep`.
+    cola_whep: mpsc::Sender<PedidoExpulsion>,
+    /// El registro de sesiones WHEP para guardar en disco (`guardar_whep_en_disco`), si hay ruta.
+    pub(super) guardar_whep: Option<watch::Sender<String>>,
     /// Solo tests: la conexión entra en pánico después de aplicar un `estado`.
     #[cfg(test)]
     panico_en_estado: std::sync::atomic::AtomicBool,
 }
 
 impl<S: SesionPs5> EstadoServidor<S> {
+    /// Carga el registro de sesiones WHEP guardado (si hay ruta) y arranca el trabajador de las
+    /// expulsiones y el que lo guarda en disco. Se llama dentro del runtime de tokio.
     pub fn new(p: Piezas<S>) -> Arc<Self> {
-        Arc::new(Self {
-            sesion: p.sesion,
-            clave: p.clave,
-            token_control: p.token_control,
-            ordenes: p.ordenes,
-            metricas: p.metricas,
-            sistema: p.sistema,
-            reloj_s: p.reloj_s,
-            t0: Instant::now(),
-            ranura: Mutex::new(ctl::Ranura::new()),
-            sin_auth: ctl::SinAuth::new(),
-            proximo_id: AtomicU64::new(1),
-            cpu: Mutex::new(0.0),
-            descartados: AtomicU64::new(0),
-            #[cfg(test)]
-            panico_en_estado: std::sync::atomic::AtomicBool::new(false),
+        let whep = p.sesiones_whep.as_deref().map(whep::cargar).unwrap_or_default();
+        let (cola_whep, rx_cola) = mpsc::channel(COLA_EXPULSIONES);
+        let guardar_whep = p.sesiones_whep.map(|ruta| {
+            let (tx, rx) = watch::channel(whep.a_json());
+            tokio::spawn(guardar_whep_en_disco(ruta, rx));
+            tx
+        });
+        let reintentos = cola_whep.downgrade();
+        let sistema = p.sistema.clone();
+        Arc::new_cyclic(|yo| {
+            tokio::spawn(trabajador_whep(yo.clone(), sistema, reintentos, rx_cola));
+            Self {
+                sesion: p.sesion,
+                clave: p.clave,
+                token_control: p.token_control,
+                ordenes: p.ordenes,
+                metricas: p.metricas,
+                sistema: p.sistema,
+                reloj_s: p.reloj_s,
+                t0: Instant::now(),
+                ranura: Mutex::new(ctl::Ranura::new(whep)),
+                cola_whep,
+                guardar_whep,
+                sin_auth: ctl::SinAuth::new(),
+                proximo_id: AtomicU64::new(1),
+                cpu: Mutex::new(0.0),
+                descartados: AtomicU64::new(0),
+                #[cfg(test)]
+                panico_en_estado: std::sync::atomic::AtomicBool::new(false),
+            }
         })
     }
 
@@ -232,7 +256,7 @@ async fn solo_local(ConnectInfo(par): ConnectInfo<SocketAddr>, req: Request, nex
 }
 
 /// Lo que manda MediaMTX (v1.21) a la autenticación externa. Los campos nuevos se ignoran.
-/// `id`: el UUID de la sesión (el mismo de `/v3/webrtcsessions/list`) en `read` y `publish`; `null`
+/// `id`: el UUID de la sesión (el mismo de `/v3/webrtc/sessions/list`) en `read` y `publish`; `null`
 /// en los pedidos que no abren sesión (como el `OPTIONS` de WHEP) y en `api`.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -304,30 +328,94 @@ async fn auth_mediamtx<S: SesionPs5>(State(e): State<Compartido<S>>, cuerpo: Byt
     }
 }
 
+// ---------------------------------------------------------------- expulsiones WHEP
+
+/// Lugar en la cola de expulsiones. Cada sesión entra una sola vez mientras está pendiente
+/// (`SesionesWhep`), así que no se llena salvo con muchísimas cuentas a la vez.
+const COLA_EXPULSIONES: usize = 256;
+/// Esperas antes de reintentar un kick fallido (después del último, queda para el próximo empuje).
+const ESPERAS_REINTENTO: [Duration; 3] = [Duration::from_secs(1), Duration::from_secs(2), Duration::from_secs(4)];
+
+/// Una expulsión en la cola: la sesión, por qué y el número de intento (0 es el primero).
+struct PedidoExpulsion {
+    id: String,
+    motivo: &'static str,
+    intento: usize,
+}
+
 impl<S: SesionPs5> EstadoServidor<S> {
-    /// Expulsa esas sesiones WHEP en segundo plano (el pedido que las provocó no espera a `curl`). La
-    /// que se expulsa (o que ya no existía) sale del registro; si falla, queda y se reintenta con el
-    /// próximo empuje. En el registro, solo los 8 primeros caracteres del `id` (como MediaMTX).
-    fn expulsar_whep(self: &Arc<Self>, ids: Vec<String>, motivo: &'static str) {
-        if ids.is_empty() {
-            return;
-        }
-        let e = self.clone();
-        tokio::spawn(async move {
-            for id in ids {
-                let corto = id.get(..8).unwrap_or("");
-                match e.sistema.expulsar_whep(&id).await {
-                    Ok(()) => {
-                        e.quitar_whep(&id);
-                        crate::info!("whep: sesión {corto} expulsada ({motivo})");
-                    }
-                    Err(m) => {
-                        static LIM: crate::registro::Limitado = crate::registro::Limitado::new();
-                        crate::limitado!(4, LIM, "whep: no se pudo expulsar la sesión {corto} ({motivo}): {m}");
-                    }
-                }
+    /// Pone esas sesiones WHEP en la cola de expulsiones (el pedido que las provocó no espera a `curl`).
+    /// Si la cola está llena, la sesión queda para el próximo intento.
+    fn expulsar_whep(&self, ids: Vec<String>, motivo: &'static str) {
+        for id in ids {
+            if let Err(e) = self.cola_whep.try_send(PedidoExpulsion { id, motivo, intento: 0 }) {
+                let p = match e {
+                    mpsc::error::TrySendError::Full(p) | mpsc::error::TrySendError::Closed(p) => p,
+                };
+                self.fallida_whep(&p.id);
+                static LIM: crate::registro::Limitado = crate::registro::Limitado::new();
+                crate::limitado!(4, LIM, "whep: la cola de expulsiones está llena; la sesión {} queda para después", corto(&p.id));
             }
-        });
+        }
+    }
+}
+
+/// Los 8 primeros caracteres del `id` (como el `[session xxxxxxxx]` del registro de MediaMTX).
+fn corto(id: &str) -> &str {
+    id.get(..8).unwrap_or("")
+}
+
+/// El único que llama a la API de MediaMTX: de a una expulsión por vez (nunca N `curl` en paralelo).
+/// Expulsada (o ya inexistente): sale del registro. Si falla, se reintenta a 1, 2 y 4 s sin frenar la
+/// cola; si fallan todos, la sesión queda para el próximo empuje (`fallida`). Termina con el servidor.
+async fn trabajador_whep<S: SesionPs5>(
+    estado: Weak<EstadoServidor<S>>,
+    sistema: Arc<dyn Sistema>,
+    reintentos: mpsc::WeakSender<PedidoExpulsion>,
+    mut cola: mpsc::Receiver<PedidoExpulsion>,
+) {
+    static EXPULSADA: crate::registro::Limitado = crate::registro::Limitado::new();
+    static FALLIDA: crate::registro::Limitado = crate::registro::Limitado::new();
+    while let Some(p) = cola.recv().await {
+        let r = sistema.expulsar_whep(&p.id).await;
+        let Some(e) = estado.upgrade() else { return };
+        match r {
+            Ok(()) => {
+                e.quitar_whep(&p.id);
+                crate::limitado!(6, EXPULSADA, "whep: sesión {} expulsada ({})", corto(&p.id), p.motivo);
+            }
+            Err(m) => match (ESPERAS_REINTENTO.get(p.intento), reintentos.upgrade()) {
+                (Some(&espera), Some(tx)) => {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(espera).await;
+                        let _ = tx.send(PedidoExpulsion { intento: p.intento + 1, ..p }).await;
+                    });
+                }
+                _ => {
+                    e.fallida_whep(&p.id);
+                    crate::limitado!(
+                        4,
+                        FALLIDA,
+                        "whep: no se pudo expulsar la sesión {} ({}): {m}; queda para el próximo empuje",
+                        corto(&p.id),
+                        p.motivo
+                    );
+                }
+            },
+        }
+    }
+}
+
+/// Guarda en disco cada versión nueva del registro de sesiones WHEP (siempre la última: `watch`), fuera
+/// del candado de la ranura. Termina con el servidor.
+async fn guardar_whep_en_disco(ruta: PathBuf, mut rx: watch::Receiver<String>) {
+    while rx.changed().await.is_ok() {
+        let json = rx.borrow_and_update().clone();
+        let r = ruta.clone();
+        if let Ok(Err(e)) = tokio::task::spawn_blocking(move || whep::guardar(&r, &json)).await {
+            static LIM: crate::registro::Limitado = crate::registro::Limitado::new();
+            crate::limitado!(4, LIM, "whep: no pude guardar el registro {}: {e}", ruta.display());
+        }
     }
 }
 
