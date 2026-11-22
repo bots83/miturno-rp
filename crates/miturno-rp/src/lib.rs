@@ -11,3 +11,4 @@ pub mod salida;
 pub mod servidor;
 pub mod sesion;
 pub mod sistema;
+pub mod vigia;

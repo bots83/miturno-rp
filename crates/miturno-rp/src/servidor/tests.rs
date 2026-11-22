@@ -189,6 +189,10 @@ fn banco() -> Banco {
 
 /// Banco con el registro de sesiones WHEP guardado en `whep` (como el de `/var/lib/miturno-rp`).
 fn banco_con(whep: Option<std::path::PathBuf>) -> Banco {
+    banco_con_vigia(whep, None)
+}
+
+fn banco_con_vigia(whep: Option<std::path::PathBuf>, vigia_estado: Option<std::path::PathBuf>) -> Banco {
     let sesion = Arc::new(ConLimite::new(SesionFalsa::new(), 3_000));
     let sistema = Arc::new(SistemaFalso::default());
     let (tx_ordenes, ordenes) = mpsc::channel(16);
@@ -202,6 +206,7 @@ fn banco_con(whep: Option<std::path::PathBuf>) -> Banco {
         sistema: sistema.clone(),
         reloj_s: || AHORA,
         sesiones_whep: whep,
+        vigia_estado,
     });
     let (conexiones, rx) = mpsc::channel(8);
     tokio::spawn(servir(Memoria(rx), estado.clone()));
@@ -1379,9 +1384,34 @@ async fn salud_tiene_la_forma_de_video_salud() {
             "mediamtx": true,
             "turn": false,
             "cpu": 0.0,
-            "jugador": {"version":null,"turnId":null,"mando":null,"inactivoMs":null}
+            "jugador": {"version":null,"turnId":null,"mando":null,"inactivoMs":null},
+            "vigia": null
         })
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn salud_incluye_el_vigia_del_archivo_y_null_si_no_cierra() {
+    let dir = std::env::temp_dir().join(format!("salud-vigia-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ruta = dir.join("estado.json");
+    let ahora_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    std::fs::write(
+        &ruta,
+        format!(r#"{{"v":1,"ts":{},"estado":"pantalla","clase":"store","seguro":true,"desde":1}}"#, ahora_ms - 2_000),
+    )
+    .unwrap();
+    let b = banco_con_vigia(None, Some(ruta.clone()));
+    let (_, cuerpo) = b.control("GET", "salud").await;
+    let v: Value = serde_json::from_str(&cuerpo).unwrap();
+    assert_eq!((&v["vigia"]["estado"], &v["vigia"]["clase"], &v["vigia"]["seguro"]), (&json!("pantalla"), &json!("store"), &json!(true)));
+    let edad = v["vigia"]["edadMs"].as_u64().unwrap();
+    assert!((2_000..10_000).contains(&edad), "edadMs {edad}");
+    std::fs::write(&ruta, "no es json").unwrap();
+    let (_, cuerpo) = b.control("GET", "salud").await;
+    let v: Value = serde_json::from_str(&cuerpo).unwrap();
+    assert_eq!(v["vigia"], Value::Null);
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[tokio::test(start_paused = true)]

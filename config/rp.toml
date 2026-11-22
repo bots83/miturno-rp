@@ -13,3 +13,5 @@ pausa = "/var/lib/miturno-rp/pausa"
 # Registro de las sesiones WHEP abiertas (sin secretos), para expulsarlas aunque miturno-rp se
 # reinicie. Va en el mismo StateDirectory; si falta, es este valor.
 # sesiones_whep = "/var/lib/miturno-rp/whep.json"
+# Veredicto del vigilante de imagen (miturno-vigia), para la salud. Si falta, la salud manda vigia: null.
+vigia_estado = "/run/miturno-vigia-estado/estado.json"

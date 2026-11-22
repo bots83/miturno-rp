@@ -113,6 +113,8 @@ pub struct Piezas<S: SesionPs5> {
     /// Dónde se guarda el registro de sesiones WHEP (`sesiones_whep` de `rp.toml`). Sin ruta, vive solo
     /// en memoria (tests).
     pub sesiones_whep: Option<PathBuf>,
+    /// `estado.json` del vigilante de imagen (`vigia_estado` de `rp.toml`). Sin ruta, la salud manda `vigia: null`.
+    pub vigia_estado: Option<PathBuf>,
 }
 
 pub struct EstadoServidor<S: SesionPs5> {
@@ -123,6 +125,7 @@ pub struct EstadoServidor<S: SesionPs5> {
     metricas: Arc<Metricas>,
     sistema: Arc<dyn Sistema>,
     reloj_s: fn() -> u64,
+    vigia_estado: Option<PathBuf>,
     /// Origen del reloj monótono (en milisegundos) del filtro y del guardián.
     t0: Instant,
     /// El único controlador que puede mandar a la PS5, el turno vigente y la actividad del jugador.
@@ -166,6 +169,7 @@ impl<S: SesionPs5> EstadoServidor<S> {
                 metricas: p.metricas,
                 sistema: p.sistema,
                 reloj_s: p.reloj_s,
+                vigia_estado: p.vigia_estado,
                 t0: Instant::now(),
                 ranura: Mutex::new(ctl::Ranura::new(whep)),
                 cola_whep,
@@ -546,12 +550,23 @@ struct VideoSalud {
     turn: bool,
     cpu: f64,
     jugador: SaludJugador,
+    /// Siempre presente: `null` sin ruta configurada o con un archivo que no cierra.
+    vigia: Option<crate::vigia::SaludVigia>,
 }
 
 async fn salud<S: SesionPs5>(State(e): State<Compartido<S>>) -> Json<VideoSalud> {
     let unidades = [UNIDAD_KICK, UNIDAD_MEDIAMTX, UNIDAD_TURN];
     let estados = e.sistema.estados(&unidades).await;
     let activo = |i: usize| estados.get(i).map(String::as_str).unwrap_or("desconocido");
+    let vigia = match e.vigia_estado.clone() {
+        Some(ruta) => {
+            let ahora_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64);
+            tokio::task::spawn_blocking(move || crate::vigia::leer_vigia(&ruta, ahora_ms)).await.ok().flatten()
+        }
+        None => None,
+    };
     Json(VideoSalud {
         sesion: e.metricas.foto(Instant::now()),
         kick: estado_kick(activo(0)),
@@ -559,5 +574,6 @@ async fn salud<S: SesionPs5>(State(e): State<Compartido<S>>) -> Json<VideoSalud>
         turn: activo(2) == "active",
         cpu: *e.cpu.lock().unwrap_or_else(|e| e.into_inner()),
         jugador: e.salud_jugador(),
+        vigia,
     })
 }
