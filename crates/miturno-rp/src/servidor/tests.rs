@@ -1500,7 +1500,8 @@ impl Banco {
         if let Some(a) = auth {
             req = req.header("authorization", a);
         }
-        rutas(self.estado.clone()).layer(MockConnectInfo(local())).oneshot(req.body(Body::empty()).unwrap()).await.unwrap()
+        let app = rutas(self.estado.clone()).layer(MockConnectInfo(local()));
+        app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap()
     }
 
     /// Se suscribe a `/control/mando` con el token de control y exige el stream.
@@ -1561,25 +1562,38 @@ async fn mando_respeta_piso_de_66ms_y_entrega_el_ultimo() {
     let b = banco_con_turno().await;
     let mut m = b.mando().await;
     m.evento().await;
+    // Un lector activo en otra tarea: sondea el stream durante la ráfaga, como un cliente real.
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(e) = m.evento_en(Duration::from_secs(10)).await {
+            if tx.send((Instant::now(), e)).is_err() {
+                break;
+            }
+        }
+    });
     let (mut ws, _) = b.ws_con(&token("jugador")).await;
-    m.evento().await;
+    rx.recv().await.expect("la toma");
     sleep(Duration::from_millis(200)).await;
-    // Cinco cambios seguidos: los del medio se funden en el último.
+    // Cinco cambios en ~10 ms: los del medio se funden en el último.
     for bit in [CRUZ, rp_core::mando::CIRCULO, rp_core::mando::CUADRADO, rp_core::mando::TRIANGULO, L1] {
         enviar(&mut ws, estado_json(bit)).await;
         sleep(Duration::from_millis(2)).await;
     }
-    let mut horas = Vec::new();
-    let mut ultimo = Value::Null;
-    while let Some(e) = m.evento_en(NADA).await {
-        horas.push(Instant::now());
-        ultimo = e;
+    let mut eventos = Vec::new();
+    for _ in 0..2 {
+        eventos.push(tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.unwrap().expect("evento"));
     }
-    assert!(!horas.is_empty() && horas.len() <= 2, "{} eventos", horas.len());
-    assert_eq!(ultimo, resumen_json(Some("t1"), L1), "el último estado siempre sale");
-    if let [a, b] = horas[..] {
-        assert!(b - a >= Duration::from_millis(66), "el piso se mide desde el envío anterior: {:?}", b - a);
-    }
+    let ((a, _), (c, ultimo)) = (&eventos[0], &eventos[1]);
+    assert_eq!(*ultimo, resumen_json(Some("t1"), L1), "el último estado siempre sale");
+    let separacion = *c - *a;
+    assert!(separacion >= Duration::from_millis(66), "el piso se mide desde el envío anterior: {separacion:?}");
+    assert!(separacion < Duration::from_millis(100), "y no espera de más: {separacion:?}");
+    // Recién enviado el último: A, B, A dentro del piso vuelve al valor ya enviado y no sale nada (ni
+    // un tercer evento de la ráfaga).
+    enviar(&mut ws, estado_json(rp_core::mando::CIRCULO)).await;
+    sleep(Duration::from_millis(2)).await;
+    enviar(&mut ws, estado_json(L1)).await;
+    assert!(tokio::time::timeout(NADA, rx.recv()).await.is_err(), "ni un tercer evento ni A, B, A dentro del piso");
 }
 
 #[tokio::test(start_paused = true)]
@@ -1608,12 +1622,12 @@ async fn mando_sale_con_null_cuando_el_jugador_suelta_o_se_corta_el_turno() {
     // El corte de /control/turno (otro turno vigente).
     b.empujar(2, Some(("u2", "t2"))).await;
     assert_eq!(m.evento().await, resumen_json(None, 0), "corte de aplicar_turno");
-    // Y al soltar la ranura (cierre de la conexión).
     let (mut ws2, _) = b.ws_con(&token_jugador("u2", "t2")).await;
     assert_eq!(m.evento().await, resumen_json(Some("t2"), 0), "el jugador nuevo toma: su estado, suelto");
     sleep(Duration::from_millis(100)).await;
     enviar(&mut ws2, estado_json(CRUZ)).await;
     assert_eq!(m.evento().await, resumen_json(Some("t2"), CRUZ));
+    // Y al soltar la ranura (cierre de la conexión).
     ws2.close(None).await.unwrap();
     assert_eq!(m.evento().await, resumen_json(None, 0), "soltar la ranura");
 }

@@ -72,7 +72,9 @@ impl TokenControl {
     pub fn new(texto: &str) -> Result<Self, String> {
         let t = texto.trim();
         if t.len() < MINIMO_TOKEN {
-            return Err(format!("el token de control está vacío o es demasiado corto (mínimo {MINIMO_TOKEN} caracteres)"));
+            return Err(format!(
+                "el token de control está vacío o es demasiado corto (mínimo {MINIMO_TOKEN} caracteres)"
+            ));
         }
         Ok(Self(t.as_bytes().to_vec()))
     }
