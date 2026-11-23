@@ -9,6 +9,7 @@ pub mod limitador;
 pub mod mando;
 pub mod protocolo;
 pub mod reintento;
+pub mod resumen;
 pub mod sin_cambios;
 
 pub use actividad::{es_actividad, Actividad, UMBRAL_GATILLO, UMBRAL_STICK};
@@ -20,6 +21,7 @@ pub use limitador::LimitadorKeyframe;
 pub use mando::EstadoMando;
 pub use protocolo::{leer_mensaje, MsgCliente, MsgServidor};
 pub use reintento::{Causa, Espera, Reintentos};
+pub use resumen::{resumir, ResumenMando};
 pub use sin_cambios::SinCambios;
 
 #[cfg(test)]

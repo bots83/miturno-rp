@@ -1450,6 +1450,192 @@ async fn mando_del_operador_no_cuenta() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn nuevo_turno_reinicia_sin_cambios() {
+    let b = banco_con_turno().await;
+    sleep(Duration::from_millis(500)).await;
+    assert!(b.salud_jugador().await["sinCambiosMs"].as_u64().unwrap() >= 500);
+    b.empujar(2, Some(("u1", "t2"))).await;
+    let ms = b.salud_jugador().await["sinCambiosMs"].as_u64().unwrap();
+    assert!(ms < 50, "el turno nuevo vuelve a contar desde cero: {ms}");
+}
+
+// ---------------------------------------------------------------- /control/mando
+
+/// Lector de un stream SSE: junta los trozos y devuelve el JSON de cada evento `data:` (ignora los
+/// comentarios de keep-alive).
+struct LectorSse {
+    flujo: axum::body::BodyDataStream,
+    pendiente: String,
+}
+
+impl LectorSse {
+    /// El próximo evento, o `None` si no llega ninguno en `espera`.
+    async fn evento_en(&mut self, espera: Duration) -> Option<Value> {
+        tokio::time::timeout(espera, async {
+            loop {
+                while let Some(i) = self.pendiente.find("\n\n") {
+                    let bloque: String = self.pendiente.drain(..i + 2).collect();
+                    if let Some(d) = bloque.trim_end().strip_prefix("data: ") {
+                        return Some(serde_json::from_str(d).expect("el evento es JSON"));
+                    }
+                }
+                match self.flujo.next().await {
+                    Some(trozo) => self.pendiente.push_str(std::str::from_utf8(&trozo.unwrap()).unwrap()),
+                    None => return None,
+                }
+            }
+        })
+        .await
+        .unwrap_or(None)
+    }
+
+    async fn evento(&mut self) -> Value {
+        self.evento_en(Duration::from_secs(5)).await.expect("llegó un evento")
+    }
+}
+
+impl Banco {
+    async fn pedir_mando(&self, auth: Option<&str>) -> axum::response::Response {
+        let mut req = Request::builder().method("GET").uri("/control/mando");
+        if let Some(a) = auth {
+            req = req.header("authorization", a);
+        }
+        rutas(self.estado.clone()).layer(MockConnectInfo(local())).oneshot(req.body(Body::empty()).unwrap()).await.unwrap()
+    }
+
+    /// Se suscribe a `/control/mando` con el token de control y exige el stream.
+    async fn mando(&self) -> LectorSse {
+        let r = self.pedir_mando(Some(&format!("Bearer {TOKEN_CONTROL}"))).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(r.headers()["content-type"], "text/event-stream");
+        LectorSse { flujo: r.into_body().into_data_stream(), pendiente: String::new() }
+    }
+}
+
+fn resumen_json(turno: Option<&str>, b: u32) -> Value {
+    json!({"turnId":turno,"b":b,"l2":0,"r2":0,"lx":0,"ly":0,"rx":0,"ry":0})
+}
+
+const NADA: Duration = Duration::from_millis(300);
+
+#[tokio::test(start_paused = true)]
+async fn mando_sin_token_401() {
+    let b = banco_con_turno().await;
+    let r = b.pedir_mando(None).await;
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    let r = b.pedir_mando(Some("Bearer otro-token")).await;
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test(start_paused = true)]
+async fn mando_primer_evento_es_el_actual() {
+    let b = banco_con_turno().await;
+    let mut vacio = b.mando().await;
+    assert_eq!(vacio.evento().await, resumen_json(None, 0), "nadie al mando: turnId null");
+    let (mut ws, _) = b.ws_con(&token("jugador")).await;
+    enviar(&mut ws, estado_json(CRUZ)).await;
+    sleep(Duration::from_millis(200)).await;
+    let mut tarde = b.mando().await;
+    assert_eq!(tarde.evento().await, resumen_json(Some("t1"), CRUZ), "el que llega tarde recibe el estado actual");
+}
+
+#[tokio::test(start_paused = true)]
+async fn mando_emite_al_cambiar_y_no_repite() {
+    let b = banco_con_turno().await;
+    let mut m = b.mando().await;
+    assert_eq!(m.evento().await, resumen_json(None, 0));
+    let (mut ws, _) = b.ws_con(&token("jugador")).await;
+    assert_eq!(m.evento().await, resumen_json(Some("t1"), 0), "el jugador toma el mando");
+    enviar(&mut ws, estado_json(CRUZ)).await;
+    assert_eq!(m.evento().await, resumen_json(Some("t1"), CRUZ));
+    // Otro estado crudo (lx distinto) que cuantiza igual: ningún evento.
+    sleep(Duration::from_millis(100)).await;
+    enviar(&mut ws, json!({"t":"estado","botones":CRUZ,"l2":0,"r2":0,"lx":300,"ly":-300,"rx":0,"ry":0})).await;
+    assert_eq!(m.evento_en(NADA).await, None, "el mismo resumen no se repite");
+    enviar(&mut ws, estado_json(0)).await;
+    assert_eq!(m.evento().await, resumen_json(Some("t1"), 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn mando_respeta_piso_de_66ms_y_entrega_el_ultimo() {
+    let b = banco_con_turno().await;
+    let mut m = b.mando().await;
+    m.evento().await;
+    let (mut ws, _) = b.ws_con(&token("jugador")).await;
+    m.evento().await;
+    sleep(Duration::from_millis(200)).await;
+    // Cinco cambios seguidos: los del medio se funden en el último.
+    for bit in [CRUZ, rp_core::mando::CIRCULO, rp_core::mando::CUADRADO, rp_core::mando::TRIANGULO, L1] {
+        enviar(&mut ws, estado_json(bit)).await;
+        sleep(Duration::from_millis(2)).await;
+    }
+    let mut horas = Vec::new();
+    let mut ultimo = Value::Null;
+    while let Some(e) = m.evento_en(NADA).await {
+        horas.push(Instant::now());
+        ultimo = e;
+    }
+    assert!(!horas.is_empty() && horas.len() <= 2, "{} eventos", horas.len());
+    assert_eq!(ultimo, resumen_json(Some("t1"), L1), "el último estado siempre sale");
+    if let [a, b] = horas[..] {
+        assert!(b - a >= Duration::from_millis(66), "el piso se mide desde el envío anterior: {:?}", b - a);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn mando_del_operador_sale_con_turn_id_null() {
+    let b = banco_con_turno().await;
+    let (mut ws, _) = b.ws_con(&token("jugador")).await;
+    enviar(&mut ws, estado_json(CRUZ)).await;
+    sleep(Duration::from_millis(200)).await;
+    let mut m = b.mando().await;
+    assert_eq!(m.evento().await, resumen_json(Some("t1"), CRUZ));
+    let (mut op, _) = b.ws_con(&token("operador")).await;
+    assert_eq!(m.evento().await, resumen_json(None, 0), "el operador toma: turnId null y todo en 0");
+    sleep(Duration::from_millis(100)).await;
+    enviar(&mut op, estado_json(L1)).await;
+    assert_eq!(m.evento_en(NADA).await, None, "lo que manda el operador no se resume");
+}
+
+#[tokio::test(start_paused = true)]
+async fn mando_sale_con_null_cuando_el_jugador_suelta_o_se_corta_el_turno() {
+    let b = banco_con_turno().await;
+    let (mut ws, _) = b.ws_con(&token("jugador")).await;
+    enviar(&mut ws, estado_json(CRUZ)).await;
+    sleep(Duration::from_millis(200)).await;
+    let mut m = b.mando().await;
+    assert_eq!(m.evento().await, resumen_json(Some("t1"), CRUZ));
+    // El corte de /control/turno (otro turno vigente).
+    b.empujar(2, Some(("u2", "t2"))).await;
+    assert_eq!(m.evento().await, resumen_json(None, 0), "corte de aplicar_turno");
+    // Y al soltar la ranura (cierre de la conexión).
+    let (mut ws2, _) = b.ws_con(&token_jugador("u2", "t2")).await;
+    assert_eq!(m.evento().await, resumen_json(Some("t2"), 0), "el jugador nuevo toma: su estado, suelto");
+    sleep(Duration::from_millis(100)).await;
+    enviar(&mut ws2, estado_json(CRUZ)).await;
+    assert_eq!(m.evento().await, resumen_json(Some("t2"), CRUZ));
+    ws2.close(None).await.unwrap();
+    assert_eq!(m.evento().await, resumen_json(None, 0), "soltar la ranura");
+}
+
+#[tokio::test(start_paused = true)]
+async fn mando_quinto_suscriptor_503() {
+    let b = banco_con_turno().await;
+    let mut abiertos = Vec::new();
+    for _ in 0..4 {
+        abiertos.push(b.mando().await);
+    }
+    let r = b.pedir_mando(Some(&format!("Bearer {TOKEN_CONTROL}"))).await;
+    assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let cuerpo = to_bytes(r.into_body(), 1 << 16).await.unwrap();
+    assert_eq!(serde_json::from_slice::<Value>(&cuerpo).unwrap(), json!({"codigo":"MANDO_OCUPADO"}));
+    // Al cerrar uno, el contador se libera (guardián Drop) y entra otro.
+    abiertos.pop();
+    let mut otro = b.mando().await;
+    assert_eq!(otro.evento().await, resumen_json(None, 0));
+}
+
+#[tokio::test(start_paused = true)]
 async fn salud_incluye_el_vigia_del_archivo_y_null_si_no_cierra() {
     let dir = std::env::temp_dir().join(format!("salud-vigia-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

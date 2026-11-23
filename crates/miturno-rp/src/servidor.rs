@@ -5,6 +5,7 @@
 //!   la misma máquina y nunca a través del proxy. Cada WHEP autorizado se registra (`whep.rs`) para
 //!   expulsarlo por la API local de MediaMTX cuando deja de corresponder: MediaMTX no vuelve a validar
 //!   una sesión abierta. Una cuenta (salvo el operador) tiene una sola sesión.
+//! - `GET /control/mando`: el resumen del mando del jugador en vivo por SSE (`mando_vivo.rs`), con el mismo token.
 //! - `GET /control/salud` y `POST /control/{reconectar,kick_on,kick_off,reposo,encender,turno}`: solo con
 //!   el token de control de la api (nunca con la credencial del navegador). `turno` recibe el turno
 //!   vigente, las vistas y si hay mandos (`leer_autorizados`; `"mandos":false` con la fila en pausa); al
@@ -14,6 +15,7 @@
 //! Nunca se registran credenciales, tokens ni el nombre de la conexión de casa.
 
 mod ctl;
+mod mando_vivo;
 #[cfg(test)]
 mod tests;
 pub(crate) mod whep;
@@ -32,7 +34,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use rp_core::{leer_autorizados, validar_con, ClaveVerificacion, Credencial};
+use rp_core::{leer_autorizados, validar_con, ClaveVerificacion, Credencial, ResumenMando};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use subtle::ConstantTimeEq;
@@ -141,6 +143,9 @@ pub struct EstadoServidor<S: SesionPs5> {
     cola_whep: mpsc::Sender<PedidoExpulsion>,
     /// El registro de sesiones WHEP para guardar en disco (`guardar_whep_en_disco`), si hay ruta.
     pub(super) guardar_whep: Option<watch::Sender<String>>,
+    /// El resumen del mando que se manda a la PS5 (para `GET /control/mando`). Solo se publica lo que cambió.
+    mando_tx: watch::Sender<ResumenMando>,
+    suscriptores_mando: Arc<mando_vivo::Suscriptores>,
     /// Solo tests: la conexión entra en pánico después de aplicar un `estado`.
     #[cfg(test)]
     panico_en_estado: std::sync::atomic::AtomicBool,
@@ -178,6 +183,8 @@ impl<S: SesionPs5> EstadoServidor<S> {
                 proximo_id: AtomicU64::new(1),
                 cpu: Mutex::new(0.0),
                 descartados: AtomicU64::new(0),
+                mando_tx: watch::channel(ResumenMando::default()).0,
+                suscriptores_mando: Arc::default(),
                 #[cfg(test)]
                 panico_en_estado: std::sync::atomic::AtomicBool::new(false),
             }
@@ -199,6 +206,7 @@ pub fn rutas<S: SesionPs5>(estado: Compartido<S>) -> Router {
         .route_layer(middleware::from_fn(solo_local));
     let control = Router::new()
         .route("/control/salud", get(salud::<S>))
+        .route("/control/mando", get(mando_vivo::mando::<S>))
         .route("/control/reconectar", post(|State(e): State<Compartido<S>>| async move { ordenar(&e, Orden::Reconectar) }))
         .route("/control/reposo", post(|State(e): State<Compartido<S>>| async move { ordenar(&e, Orden::Reposo) }))
         .route("/control/encender", post(|State(e): State<Compartido<S>>| async move { ordenar(&e, Orden::Encender) }))

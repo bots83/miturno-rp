@@ -38,8 +38,8 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use rp_core::{
-    leer_mensaje, validar_con, Actividad, Autorizados, Credencial, EstadoMando, Filtro, Guardian, MsgCliente, SinCambios,
-    MsgServidor, Rol,
+    leer_mensaje, resumir, validar_con, Actividad, Autorizados, Credencial, EstadoMando, Filtro, Guardian, MsgCliente,
+    MsgServidor, ResumenMando, Rol, SinCambios,
 };
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{sleep_until, timeout, Instant};
@@ -127,7 +127,13 @@ pub(super) struct Ranura {
 
 impl Ranura {
     pub(super) fn new(whep: SesionesWhep) -> Self {
-        Self { ocupante: None, autorizados: Autorizados::vacio(), actividad: Actividad::new(), sin_cambios: SinCambios::new(), whep }
+        Self {
+            ocupante: None,
+            autorizados: Autorizados::vacio(),
+            actividad: Actividad::new(),
+            sin_cambios: SinCambios::new(),
+            whep,
+        }
     }
 }
 
@@ -282,9 +288,23 @@ impl<S: SesionPs5> EstadoServidor<S> {
             r.ocupante =
                 Some(Ocupante { id, rol: cred.rol, sub: cred.sub.clone(), turn_id: cred.turn_id.clone(), aviso: tx });
             self.sesion.poner_mando(&EstadoMando::suelto());
+            self.publicar_mando(r.ocupante.as_ref().and_then(Ocupante::turno_jugador), &EstadoMando::suelto());
             Ok(rx)
         })?;
         Ok((Dueno { e: self.clone(), id }, rx))
+    }
+
+    /// Publica el resumen del mando que recibe la PS5 (`None`: no controla un jugador, todo en cero),
+    /// solo si cambió. Se llama con la ranura tomada: el orden de las publicaciones es el de las órdenes.
+    fn publicar_mando(&self, turn_id: Option<&str>, estado: &EstadoMando) {
+        let nuevo = resumir(turn_id, estado);
+        self.mando_tx.send_if_modified(|actual: &mut ResumenMando| {
+            let cambio = *actual != nuevo;
+            if cambio {
+                *actual = nuevo;
+            }
+            cambio
+        });
     }
 
     /// Pasa el estado a la PS5 solo si esta conexión es la que controla; si es un jugador, lo registra
@@ -297,6 +317,7 @@ impl<S: SesionPs5> EstadoServidor<S> {
             if let Some(o) = r.ocupante.as_ref().filter(|o| o.id == id) {
                 self.sesion.poner_mando(estado);
                 if let Some(t) = o.turno_jugador() {
+                    self.publicar_mando(Some(t), estado);
                     r.actividad.registrar(t, estado, ahora);
                     if origen == Origen::Jugador {
                         r.sin_cambios.registrar(t, estado, ahora);
@@ -316,6 +337,7 @@ impl<S: SesionPs5> EstadoServidor<S> {
                     r.actividad.soltar(t, ahora);
                 }
                 r.ocupante = None;
+                self.publicar_mando(None, &EstadoMando::suelto());
             }
         });
     }
@@ -344,6 +366,7 @@ impl<S: SesionPs5> EstadoServidor<S> {
             if let Some(t) = o.turno_jugador() {
                 r.actividad.soltar(t, ahora);
             }
+            self.publicar_mando(None, &EstadoMando::suelto());
             let _ = o.aviso.send(motivo);
             Ok(TurnoAplicado { anterior, cortada: Some((o.id, motivo)), expulsar })
         })
