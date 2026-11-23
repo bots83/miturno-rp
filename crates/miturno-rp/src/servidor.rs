@@ -520,6 +520,8 @@ pub(super) struct SaludJugador {
     turn_id: Option<String>,
     mando: Option<&'static str>,
     inactivo_ms: Option<u64>,
+    /// Ms desde el último cambio real del mando del jugador (`SinCambios`); `null` sin turno.
+    sin_cambios_ms: Option<u64>,
 }
 
 /// `VideoSalud.kick` (los nombres y valores los fija el tipo de la api).

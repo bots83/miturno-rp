@@ -38,7 +38,7 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use rp_core::{
-    leer_mensaje, validar_con, Actividad, Autorizados, Credencial, EstadoMando, Filtro, Guardian, MsgCliente,
+    leer_mensaje, validar_con, Actividad, Autorizados, Credencial, EstadoMando, Filtro, Guardian, MsgCliente, SinCambios,
     MsgServidor, Rol,
 };
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
@@ -121,13 +121,23 @@ pub(super) struct Ranura {
     pub(super) ocupante: Option<Ocupante>,
     autorizados: Autorizados,
     actividad: Actividad,
+    sin_cambios: SinCambios,
     whep: SesionesWhep,
 }
 
 impl Ranura {
     pub(super) fn new(whep: SesionesWhep) -> Self {
-        Self { ocupante: None, autorizados: Autorizados::vacio(), actividad: Actividad::new(), whep }
+        Self { ocupante: None, autorizados: Autorizados::vacio(), actividad: Actividad::new(), sin_cambios: SinCambios::new(), whep }
     }
+}
+
+/// De dónde viene un estado que se manda a la PS5: lo que cambia el mando del jugador (`Jugador`, un
+/// mensaje `estado` real) o algo que arma el servidor (`Sintetico`: el todo suelto por silencio y su
+/// re-aplicación al volver). Solo el primero cuenta para `SinCambios`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Origen {
+    Jugador,
+    Sintetico,
 }
 
 /// `/control/turno` con una versión menor que la guardada (que va adentro).
@@ -279,14 +289,18 @@ impl<S: SesionPs5> EstadoServidor<S> {
 
     /// Pasa el estado a la PS5 solo si esta conexión es la que controla; si es un jugador, lo registra
     /// en la actividad (un estado sin actividad, como el todo suelto por silencio, equivale a
-    /// `Actividad::soltar`).
-    pub(super) fn mandar(&self, id: u64, estado: &EstadoMando) {
+    /// `Actividad::soltar`). `SinCambios` solo registra lo que `Origen::Jugador` dice que mandó el
+    /// propio jugador: el todo suelto por silencio y su re-aplicación son `Origen::Sintetico`.
+    pub(super) fn mandar(&self, id: u64, estado: &EstadoMando, origen: Origen) {
         let ahora = self.ahora_ms();
         self.con_ranura(|r| {
             if let Some(o) = r.ocupante.as_ref().filter(|o| o.id == id) {
                 self.sesion.poner_mando(estado);
                 if let Some(t) = o.turno_jugador() {
                     r.actividad.registrar(t, estado, ahora);
+                    if origen == Origen::Jugador {
+                        r.sin_cambios.registrar(t, estado, ahora);
+                    }
                 }
             }
         });
@@ -318,7 +332,9 @@ impl<S: SesionPs5> EstadoServidor<S> {
                 return Err(VersionVieja(anterior));
             }
             r.autorizados = a;
-            r.actividad.turno(r.autorizados.jugador.as_ref().map(|j| j.turn_id.as_str()), ahora);
+            let turno = r.autorizados.jugador.as_ref().map(|j| j.turn_id.as_str());
+            r.actividad.turno(turno, ahora);
+            r.sin_cambios.turno(turno, ahora);
             let expulsar = r.whep.no_autorizadas(&r.autorizados);
             let corte = r.ocupante.as_ref().and_then(|o| o.corte(&r.autorizados));
             let (Some(motivo), Some(o)) = (corte, r.ocupante.take_if(|_| corte.is_some())) else {
@@ -387,6 +403,7 @@ impl<S: SesionPs5> EstadoServidor<S> {
                 Rol::Vista => None,
             }),
             inactivo_ms: r.actividad.inactivo_ms(ahora),
+            sin_cambios_ms: r.sin_cambios.ms(ahora),
         })
     }
 }
@@ -586,7 +603,7 @@ async fn bucle<S: SesionPs5>(
                     crate::depurar!("ctl: conexión {id}: {SILENCIO_MS} ms sin mensajes; todo suelto");
                     // Sin actividad: para la del jugador, `mandar` equivale a `Actividad::soltar`.
                     let salida = filtro.aplicar(&EstadoMando::suelto(), ahora);
-                    e.mandar(id, &salida);
+                    e.mandar(id, &salida, Origen::Sintetico);
                     suelto_por_silencio = true;
                 }
             }
@@ -602,7 +619,7 @@ async fn bucle<S: SesionPs5>(
                 let volvio_del_silencio = std::mem::take(&mut suelto_por_silencio);
                 if volvio_del_silencio && !matches!(m, MsgCliente::Estado { .. } | MsgCliente::Auth { .. }) {
                     crate::depurar!("ctl: conexión {id}: volvió tras el silencio; reaplico el último estado");
-                    e.mandar(id, &ultima_filtrada);
+                    e.mandar(id, &ultima_filtrada, Origen::Sintetico);
                 }
                 match m {
                     MsgCliente::Auth { .. } => return Fin::Formato,
@@ -610,7 +627,7 @@ async fn bucle<S: SesionPs5>(
                         let entrada = EstadoMando { botones, l2, r2, lx, ly, rx, ry };
                         let salida = filtro.aplicar(&entrada, ahora);
                         ultima_filtrada = salida;
-                        e.mandar(id, &salida);
+                        e.mandar(id, &salida, Origen::Jugador);
                         #[cfg(test)]
                         if e.panico_en_estado.load(std::sync::atomic::Ordering::SeqCst) {
                             panic!("pánico de prueba en la conexión {id}");

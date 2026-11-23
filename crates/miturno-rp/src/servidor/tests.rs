@@ -661,10 +661,10 @@ async fn ranura_solo_el_dueno_manda_y_suelta() {
     let _r1 = e.tomar(1, &cred(rp_core::Rol::Operador)).unwrap();
     let _r2 = e.tomar(2, &cred(rp_core::Rol::Operador)).unwrap();
     let antes = b.mandos().len();
-    e.mandar(1, &con(CRUZ));
+    e.mandar(1, &con(CRUZ), ctl::Origen::Jugador);
     e.soltar(1);
     assert_eq!(b.mandos().len(), antes, "la conexión reemplazada ni manda ni suelta");
-    e.mandar(2, &con(PS));
+    e.mandar(2, &con(PS), ctl::Origen::Jugador);
     assert_eq!(b.ultimo_mando(), con(PS));
     assert_eq!(e.tomar(3, &cred(rp_core::Rol::Jugador)).err(), Some("OCUPADO"), "un rol menor no toma");
     e.soltar(2);
@@ -695,7 +695,7 @@ async fn ranura_una_tarea_cancelada_libera_y_suelta_una_vez() {
     let e = b.estado.clone();
     let tarea = tokio::spawn(async move {
         let (_dueno, _aviso) = e.tomar(7, &cred(rp_core::Rol::Operador)).unwrap();
-        e.mandar(7, &con(CRUZ));
+        e.mandar(7, &con(CRUZ), ctl::Origen::Jugador);
         std::future::pending::<()>().await;
     });
     sleep(Duration::from_millis(5)).await;
@@ -1384,10 +1384,69 @@ async fn salud_tiene_la_forma_de_video_salud() {
             "mediamtx": true,
             "turn": false,
             "cpu": 0.0,
-            "jugador": {"version":null,"turnId":null,"mando":null,"inactivoMs":null},
+            "jugador": {"version":null,"turnId":null,"mando":null,"inactivoMs":null,"sinCambiosMs":null},
             "vigia": null
         })
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn salud_trae_sin_cambios_ms() {
+    let b = banco();
+    let j = b.salud_jugador().await;
+    assert!(j.as_object().unwrap().contains_key("sinCambiosMs"), "el campo está");
+    assert_eq!(j["sinCambiosMs"], Value::Null, "sin turno es null");
+    b.empujar(1, Some(("u1", "t1"))).await;
+    sleep(Duration::from_millis(250)).await;
+    assert_eq!(b.salud_jugador().await["sinCambiosMs"], json!(250), "con turno cuenta desde que empezó");
+}
+
+#[tokio::test(start_paused = true)]
+async fn silencio_y_reaplicacion_no_reinician_sin_cambios() {
+    let b = banco_con_turno().await;
+    let (mut ws, _) = b.ws_con(&token("jugador")).await;
+    enviar(&mut ws, estado_json(CRUZ)).await;
+    sleep(Duration::from_millis(5)).await;
+    let desde = b.salud_jugador().await["sinCambiosMs"].as_u64().unwrap();
+    assert!(desde < 100, "el CRUZ real reinició la cuenta: {desde}");
+    // Silencio de más de 500 ms: todo suelto (sintético); el latido reaplica CRUZ (sintético).
+    sleep(Duration::from_millis(600)).await;
+    assert_eq!(b.ultimo_mando(), EstadoMando::suelto());
+    enviar(&mut ws, json!({"t":"latido"})).await;
+    sleep(Duration::from_millis(5)).await;
+    assert_eq!(b.ultimo_mando(), con(CRUZ));
+    let tras = b.salud_jugador().await["sinCambiosMs"].as_u64().unwrap();
+    assert!(tras >= desde + 600, "sigue creciendo desde el CRUZ original: {desde} → {tras}");
+    // Mandar CRUZ de nuevo, igual al último contado, tampoco reinicia.
+    enviar(&mut ws, estado_json(CRUZ)).await;
+    sleep(Duration::from_millis(5)).await;
+    let luego = b.salud_jugador().await["sinCambiosMs"].as_u64().unwrap();
+    assert!(luego >= tras, "el mismo estado no reinicia: {tras} → {luego}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn soltar_de_la_web_si_cuenta() {
+    let b = banco_con_turno().await;
+    let (mut ws, _) = b.ws_con(&token("jugador")).await;
+    enviar(&mut ws, estado_json(CRUZ)).await;
+    sleep(Duration::from_millis(400)).await;
+    assert!(b.salud_jugador().await["sinCambiosMs"].as_u64().unwrap() >= 400);
+    enviar(&mut ws, estado_json(0)).await;
+    sleep(Duration::from_millis(5)).await;
+    let ms = b.salud_jugador().await["sinCambiosMs"].as_u64().unwrap();
+    assert!(ms < 50, "el soltar de la web reinició la cuenta: {ms}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn mando_del_operador_no_cuenta() {
+    let b = banco_con_turno().await;
+    let (mut ws, _) = b.ws_con(&token("operador")).await;
+    sleep(Duration::from_millis(300)).await;
+    enviar(&mut ws, estado_json(CRUZ)).await;
+    sleep(Duration::from_millis(5)).await;
+    assert_eq!(b.ultimo_mando(), con(CRUZ));
+    let ms = b.salud_jugador().await["sinCambiosMs"].as_u64().unwrap();
+    assert!(ms >= 300, "el operador no reinicia: {ms}");
 }
 
 #[tokio::test(start_paused = true)]
@@ -1733,7 +1792,7 @@ fn r2_json() -> Value {
 #[tokio::test(start_paused = true)]
 async fn salud_jugador_sin_empuje_es_todo_null() {
     let b = banco();
-    assert_eq!(b.salud_jugador().await, json!({"version":null,"turnId":null,"mando":null,"inactivoMs":null}));
+    assert_eq!(b.salud_jugador().await, json!({"version":null,"turnId":null,"mando":null,"inactivoMs":null,"sinCambiosMs":null}));
 }
 
 #[tokio::test(start_paused = true)]
