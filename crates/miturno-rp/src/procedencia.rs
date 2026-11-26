@@ -101,7 +101,7 @@ impl Emisor {
         let archivo = OpenOptions::new().write(true).create_new(true).mode(0o600).open(marca)
             .map_err(|_| "no se pudo reservar la serie o la sesión ya se usó")?;
         archivo.sync_all().and_then(|()| File::open(estado)?.sync_all())
-            .map_err(|_| "no se pudo persistir el uso de la reserva")
+            .map_err(|_| "no se pudo persistir el uso de la reserva".into())
     }
 
     /// La ausencia de la credencial conserva la salida previa. Un fallo afecta solo la procedencia.
