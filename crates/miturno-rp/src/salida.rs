@@ -17,6 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::cartel::Cartel;
 use crate::mux::{duracion_opus, partir_annexb, tipo_nal, Destino, Mux, CUADRO, HZ};
+use crate::procedencia::Emisor;
 use crate::sincronia::{Resumen, Sincronia};
 
 /// Largo del reloj de MPEG-TS: PTS y PCR son de 33 bits.
@@ -80,6 +81,7 @@ pub struct Salida<D: Destino> {
     parametros: Vec<u8>,
     /// Registro del desfase de las marcas de la PS5 contra el reloj y de sus huecos (solo mira).
     sincronia: Sincronia,
+    procedencia: Option<Emisor>,
     /// Los resúmenes de sincronía que salieron al registro, para los tests.
     #[cfg(test)]
     registrados: Vec<String>,
@@ -100,6 +102,7 @@ impl<D: Destino> Salida<D> {
             dur_audio_ps5: 480 * HZ / 48_000,
             parametros: Vec::new(),
             sincronia: Sincronia::new(),
+            procedencia: None,
             #[cfg(test)]
             registrados: Vec::new(),
         }
@@ -107,6 +110,11 @@ impl<D: Destino> Salida<D> {
 
     pub fn destino(&self) -> &D {
         self.mux.destino()
+    }
+
+    pub fn con_procedencia(mut self, emisor: Option<Emisor>) -> Self {
+        self.procedencia = emisor;
+        self
     }
 
     #[cfg(test)]
@@ -177,7 +185,9 @@ impl<D: Destino> Salida<D> {
                 let i = (v % self.cartel.video.len() as u64) as usize;
                 self.v_sig = pv + CUADRO;
                 self.modo = Modo::Cartel { base, v: v + 1, a };
-                self.mux.video(&self.cartel.video[i], pv, i == 0)
+                let cuadro = &self.cartel.video[i];
+                let marcado = self.procedencia.as_mut().and_then(|e| e.marcar(cuadro, false, pv, ahora));
+                self.mux.video(marcado.as_deref().unwrap_or(cuadro), pv, i == 0)
             } else {
                 let (_, p) = &self.cartel.audio[(a % self.cartel.audio.len() as u64) as usize];
                 self.a_sig = pa + duracion_opus(p).unwrap_or(0);
@@ -249,7 +259,8 @@ impl<D: Destino> Salida<D> {
             Cow::Borrowed(au)
         };
         self.v_sig = pts + CUADRO;
-        if let Err(e) = self.mux.video(&datos, pts, clave) {
+        let marcado = self.procedencia.as_mut().and_then(|e| e.marcar(&datos, true, pts, ahora));
+        if let Err(e) = self.mux.video(marcado.as_deref().unwrap_or(&datos), pts, clave) {
             crate::falla!("salida: no pude escribir un cuadro de la PS5: {e}");
         }
         self.sincronia.video(pts as i64 - reloj as i64, ahora);

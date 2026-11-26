@@ -16,6 +16,7 @@ use miturno_rp::cartel::Cartel;
 use miturno_rp::config::{self, Argumentos, Rutas};
 use miturno_rp::metricas::Metricas;
 use miturno_rp::mux::DestinoUdp;
+use miturno_rp::procedencia::{self, Emisor};
 use miturno_rp::salida::{self, Salida};
 use miturno_rp::servidor::{self, EstadoServidor, Piezas};
 use miturno_rp::sesion::libchiaki::SesionLibchiaki;
@@ -25,7 +26,17 @@ use miturno_rp::{ciclo, falla, info};
 use tokio::signal::unix::{signal, SignalKind};
 
 fn main() -> ExitCode {
-    let rutas = match config::parsear_argumentos(std::env::args().skip(1)) {
+    let argumentos: Vec<_> = std::env::args().skip(1).collect();
+    if argumentos.first().is_some_and(|a| a == "--procedencia-sintetica") {
+        return match procedencia::producir_sintetico(&argumentos[1..], &mut std::io::stdout().lock()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                falla!("{e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    let rutas = match config::parsear_argumentos(argumentos) {
         Ok(Argumentos::Version) => {
             println!("miturno-rp {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
@@ -56,6 +67,13 @@ fn correr(rutas: Rutas) -> Result<(), String> {
     let clave = servidor::cargar_clave_publica(&config.clave_publica)?;
     let token_control = servidor::cargar_token_control(&config.token_control)?;
     let http: std::net::SocketAddr = config.http.parse().expect("validada al cargar la configuración");
+    let procedencia = match Emisor::desde_systemd() {
+        Ok(emisor) => emisor,
+        Err(e) => {
+            miturno_rp::aviso!("salida: procedencia desactivada: {e}");
+            None
+        }
+    };
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -100,7 +118,8 @@ fn correr(rutas: Rutas) -> Result<(), String> {
             cartel.video.len(),
             config.bitrate_kbps
         );
-        ciclo::correr(sesion, perfil, Salida::new(cartel, destino, salida::origen_del_reloj()), senales, enlace).await?;
+        let salida = Salida::new(cartel, destino, salida::origen_del_reloj()).con_procedencia(procedencia);
+        ciclo::correr(sesion, perfil, salida, senales, enlace).await?;
         info!("miturno-rp: listo");
         Ok(())
     })

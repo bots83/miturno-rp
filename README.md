@@ -54,6 +54,18 @@ Límites conocidos:
 
 Sin sesión, la salida repite el cartel "Volvemos enseguida" (`/var/lib/miturno-video/cartel.ts`); al conectar, empalma en el primer keyframe de la PS5. Las marcas de tiempo son propias y continuas. Ante SIGTERM cierra la sesión con `session.stop()` antes de salir. `MITURNO_RP_DEPURAR=1` activa el registro de depuración.
 
+## Procedencia autenticada por cuadro
+
+La salida puede incluir una marca SEI v3 firmada con Ed25519 por cada cuadro del empalme. Su payload empieza con los 16 bytes ASCII `miturno-vigia-v3`, una versión `3`, el origen (`0` cartel, `1` PS5, `2` sintético), un byte con el largo y el identificador ASCII de sesión, la serie, la hora UTC en milisegundos y el PTS de 90 kHz módulo 2^33. Los tres enteros son u64 big endian. Siguen los 32 bytes SHA-256, calculados concatenando para cada NAL VCL su largo u32 big endian y sus bytes EBSP con encabezado, sin el código Annex B ni ceros finales de transporte. Los últimos 64 bytes son la firma de todos los anteriores. El emisor conserva el orden de los NAL existentes y agrega el SEI antes del primer VCL. El PTS, el PCR y el audio siguen sus rutas habituales.
+
+La opción arranca apagada. Una instalación autorizada puede aportar `vigia-procedencia.json` mediante `LoadCredential` de systemd. El JSON privado contiene `v` igual a `3`, `sesion` opaca, `desde_ms`, `hasta_ms` y `semilla_b64` (32 bytes Ed25519 en Base64 estándar). La reserva dura hasta ocho horas y debe estar vigente al arrancar. El `StateDirectory` conserva la marca de uso de esa sesión para impedir que un reinicio vuelva a emitir series desde uno. Cada nueva reserva requiere otro identificador. Si la credencial falta, es inválida o caduca, el video sigue su curso sin nuevas constancias.
+
+El doble aislado usa el mismo empalme y multiplexor. Produce MPEG-TS por stdout a partir de dos archivos de 60 fps sin cuadros B, ambos con SPS, PPS e IDR iniciales y Opus opcional. Alterna cartel, juego simulado, caída, recuperación y cartel final. Solo emite origen `0` o `2`, y usa una credencial de laboratorio privada.
+
+```bash
+miturno-rp --procedencia-sintetica CARTEL.ts JUEGO.ts CREDENCIAL.json INICIO_UNIX_MS > SALIDA.ts
+```
+
 ## Compilar
 
 Requiere la librería libchiaki compilada con [nanpuyue/libchiaki](https://github.com/nanpuyue/libchiaki) (`build-libchiaki.sh`, `CHIAKI_VERSION=v1.10.1`):

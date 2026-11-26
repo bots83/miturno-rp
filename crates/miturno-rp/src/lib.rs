@@ -6,6 +6,7 @@ pub mod config;
 pub mod metricas;
 pub mod mux;
 pub mod pausa;
+pub mod procedencia;
 pub mod registro;
 pub mod salida;
 pub mod servidor;

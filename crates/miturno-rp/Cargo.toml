@@ -21,6 +21,9 @@ toml = { version = "=1.2.1", default-features = false, features = ["std", "parse
 base64 = "=0.22.1"
 # Solo `stream::unfold` para el stream SSE de /control/mando (axum ya la trae).
 futures-util = { version = "=0.3.34", default-features = false }
+ed25519-dalek = "=3.0.0"
+sha2 = "=0.10.9"
+zeroize = "=1.9.1"
 
 [dev-dependencies]
 tokio = { version = "=1.54.1", features = ["rt", "macros", "time", "sync", "signal", "net", "process", "io-util", "test-util"] }
