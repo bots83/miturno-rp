@@ -27,6 +27,22 @@ use tokio::signal::unix::{signal, SignalKind};
 
 fn main() -> ExitCode {
     let argumentos: Vec<_> = std::env::args().skip(1).collect();
+    if argumentos == ["--verificar-credencial"] {
+        return match Emisor::verificar_credencial_systemd() {
+            Ok(Some(_)) => {
+                println!("Procedencia: credencial válida");
+                ExitCode::SUCCESS
+            }
+            Ok(None) => {
+                println!("Procedencia: deshabilitada");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                falla!("{e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if argumentos.first().is_some_and(|a| a == "--procedencia-sintetica") {
         return match procedencia::producir_sintetico(&argumentos[1..], &mut std::io::stdout().lock()) {
             Ok(()) => ExitCode::SUCCESS,

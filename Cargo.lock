@@ -824,6 +824,7 @@ dependencies = [
  "futures-util",
  "jsonwebtoken",
  "libchiaki",
+ "libc",
  "mpeg2ts",
  "rp-core",
  "serde",

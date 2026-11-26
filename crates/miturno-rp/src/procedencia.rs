@@ -2,7 +2,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -21,6 +21,7 @@ const MASCARA_PTS: u64 = (1 << 33) - 1;
 const DURACION_MAXIMA_MS: u64 = 8 * 60 * 60 * 1000;
 const LIMITE_CREDENCIAL: u64 = 1024;
 const LIMITE_CLIP: u64 = 16 * 1024 * 1024;
+const CREDENCIALES_SYSTEMD: &str = "/run/credentials";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,6 +39,10 @@ fn utc_ms() -> Option<u64> {
 
 fn leer_limitado(ruta: &Path, limite: u64) -> Result<Vec<u8>, String> {
     let archivo = File::open(ruta).map_err(|_| "no se pudo abrir el archivo")?;
+    leer_abierto(archivo, limite)
+}
+
+fn leer_abierto(archivo: File, limite: u64) -> Result<Vec<u8>, String> {
     let meta = archivo.metadata().map_err(|_| "no se pudo comprobar el archivo")?;
     if !meta.is_file() || meta.len() > limite {
         return Err("archivo inválido o demasiado grande".into());
@@ -86,14 +91,22 @@ impl Emisor {
         })
     }
 
-    fn cargar(ruta: &Path, sintesis: Option<u64>) -> Result<Self, String> {
-        let meta = ruta.symlink_metadata().map_err(|_| "no se pudo comprobar la credencial")?;
-        if !meta.is_file() || meta.permissions().mode() & 0o077 != 0 {
+    fn cargar(ruta: &Path, sintesis: Option<u64>) -> Result<Option<Self>, String> {
+        let archivo = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(ruta).map_err(|_| "no se pudo abrir la credencial")?;
+        let meta = archivo.metadata().map_err(|_| "no se pudo comprobar la credencial")?;
+        // systemd puede representar la ACL de lectura del usuario del servicio con una máscara 0440.
+        // El directorio oficial y sus permisos se comprueban antes de llegar a esta llamada.
+        let bits_ajenos = if sintesis.is_none() { 0o037 } else { 0o077 };
+        if !meta.is_file() || meta.permissions().mode() & bits_ajenos != 0 {
             return Err("credencial de procedencia sin permisos privados".into());
         }
-        let bytes = Zeroizing::new(leer_limitado(ruta, LIMITE_CREDENCIAL)?);
+        let bytes = Zeroizing::new(leer_abierto(archivo, LIMITE_CREDENCIAL)?);
+        if sintesis.is_none() && bytes.as_slice() == b"deshabilitada" {
+            return Ok(None);
+        }
         let reserva = serde_json::from_slice(&bytes).map_err(|_| "credencial de procedencia inválida")?;
-        Self::de_reserva(reserva, sintesis)
+        Self::de_reserva(reserva, sintesis).map(Some)
     }
 
     fn consumir_reserva(&self, estado: &Path) -> Result<(), String> {
@@ -104,18 +117,32 @@ impl Emisor {
             .map_err(|_| "no se pudo persistir el uso de la reserva".into())
     }
 
-    /// La ausencia de la credencial conserva la salida previa. Un fallo afecta solo la procedencia.
-    pub fn desde_systemd() -> Result<Option<Self>, String> {
+    /// Evalúa la credencial activa sin consumirla ni crear una conexión.
+    pub fn verificar_credencial_systemd() -> Result<Option<Self>, String> {
         let Some(credenciales) = std::env::var_os("CREDENTIALS_DIRECTORY") else { return Ok(None) };
-        let ruta = Path::new(&credenciales).join("vigia-procedencia.json");
+        let directorio = Path::new(&credenciales);
+        if directorio.parent() != Some(Path::new(CREDENCIALES_SYSTEMD)) {
+            return Err("directorio de credenciales fuera de systemd".into());
+        }
+        let meta = directorio.symlink_metadata().map_err(|_| "no se pudo comprobar el directorio de credenciales")?;
+        if !meta.is_dir() || meta.uid() != 0 || meta.permissions().mode() & 0o027 != 0 {
+            return Err("directorio de credenciales de systemd sin protección".into());
+        }
+        let ruta = directorio.join("vigia-procedencia.json");
         if matches!(ruta.symlink_metadata(), Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
             return Ok(None);
         }
-        let emisor = Self::cargar(&ruta, None)?;
+        let Some(emisor) = Self::cargar(&ruta, None)? else { return Ok(None) };
         let ahora = utc_ms().ok_or("reloj UTC inválido")?;
         if !(emisor.desde_ms..emisor.hasta_ms).contains(&ahora) {
             return Err("la reserva de procedencia no está vigente".into());
         }
+        Ok(Some(emisor))
+    }
+
+    /// La ausencia de la credencial conserva la salida previa. Un fallo afecta solo la procedencia.
+    pub fn desde_systemd() -> Result<Option<Self>, String> {
+        let Some(emisor) = Self::verificar_credencial_systemd()? else { return Ok(None) };
         let estado = std::env::var_os("STATE_DIRECTORY").ok_or("falta StateDirectory para reservar la serie")?;
         emisor.consumir_reserva(Path::new(&estado))?;
         Ok(Some(emisor))
@@ -224,7 +251,7 @@ pub fn producir_sintetico(argumentos: &[String], destino: &mut impl Write) -> Re
         return Err("uso: miturno-rp --procedencia-sintetica CARTEL.ts JUEGO.ts CREDENCIAL.json INICIO_UNIX_MS".into());
     };
     let inicio_ms: u64 = inicio_ms.parse().map_err(|_| "inicio sintético inválido")?;
-    let emisor = Emisor::cargar(Path::new(credencial), Some(inicio_ms))?;
+    let emisor = Emisor::cargar(Path::new(credencial), Some(inicio_ms))?.ok_or("falta firmante sintético")?;
     let cargar_clip = |r: &str| Cartel::desde_ts(&leer_limitado(Path::new(r), LIMITE_CLIP)?);
     let cartel = cargar_clip(cartel)?;
     let juego = cargar_clip(juego)?;
@@ -352,13 +379,45 @@ mod tests {
         }
     }
 
-    #[test]
-    fn una_reserva_real_no_puede_reiniciar_su_serie() {
+    fn carpeta() -> Carpeta {
         let carpeta = std::env::temp_dir().join(format!(
             "miturno-vigia-emisor-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir(&carpeta).unwrap();
-        let carpeta = Carpeta(carpeta);
+        Carpeta(carpeta)
+    }
+
+    #[test]
+    fn admite_la_acl_de_systemd_y_rechaza_el_acceso_ajeno() {
+        use std::fs::{set_permissions, write, Permissions};
+        use std::os::unix::fs::symlink;
+
+        let carpeta = carpeta();
+        let ruta = carpeta.0.join("credencial.json");
+        let base = reserva();
+        write(&ruta, serde_json::json!({ "v": 3, "sesion": base.sesion,
+            "desde_ms": base.desde_ms, "hasta_ms": base.hasta_ms, "semilla_b64": base.semilla_b64,
+        }).to_string()).unwrap();
+        set_permissions(&ruta, Permissions::from_mode(0o440)).unwrap();
+        assert!(Emisor::cargar(&ruta, None).unwrap().is_some());
+        assert!(Emisor::cargar(&ruta, Some(INICIO)).is_err());
+        let enlace = carpeta.0.join("enlace");
+        symlink(&ruta, &enlace).unwrap();
+        assert!(Emisor::cargar(&enlace, None).is_err());
+        for modo in [0o460, 0o444, 0o441] {
+            set_permissions(&ruta, Permissions::from_mode(modo)).unwrap();
+            assert!(Emisor::cargar(&ruta, None).is_err());
+        }
+        set_permissions(&ruta, Permissions::from_mode(0o600)).unwrap();
+        assert!(Emisor::cargar(&ruta, Some(INICIO)).unwrap().is_some());
+        write(&ruta, b"deshabilitada").unwrap();
+        assert!(Emisor::cargar(&ruta, None).unwrap().is_none());
+        assert!(Emisor::cargar(&ruta, Some(INICIO)).is_err());
+    }
+
+    #[test]
+    fn una_reserva_real_no_puede_reiniciar_su_serie() {
+        let carpeta = carpeta();
         let emisor = Emisor::de_reserva(reserva(), None).unwrap();
         emisor.consumir_reserva(&carpeta.0).unwrap();
         let reiniciado = Emisor::de_reserva(reserva(), None).unwrap();
@@ -381,27 +440,28 @@ mod tests {
         let sin_marcas = ensayar(false);
         let con_marcas = ensayar(true);
         assert_eq!(sin_marcas.len(), con_marcas.len());
+        let sin_audio = sin_marcas.iter().filter(|(id, _, _)| *id == ID_AUDIO);
+        let con_audio = con_marcas.iter().filter(|(id, _, _)| *id == ID_AUDIO);
+        assert!(sin_audio.eq(con_audio));
+        let sin_video: Vec<_> = sin_marcas.iter().filter(|(id, _, _)| *id == ID_VIDEO).collect();
+        let con_video: Vec<_> = con_marcas.iter().filter(|(id, _, _)| *id == ID_VIDEO).collect();
+        assert_eq!(sin_video.len(), con_video.len());
         let mut serie = 0;
         let mut origenes = Vec::new();
-        for ((id, pts, base), (nuevo_id, nuevo_pts, marcado)) in sin_marcas.iter().zip(&con_marcas) {
-            assert_eq!((id, pts), (nuevo_id, nuevo_pts));
-            if *id == ID_AUDIO {
-                assert_eq!(base, marcado);
-            } else {
-                assert_eq!(*id, ID_VIDEO);
-                let nals = partir_annexb(marcado);
-                let nal = nals.iter().find(|n| tipo_nal(n) == Some(6)).unwrap();
-                let carga = carga_sei(nal);
-                serie += 1;
-                assert_eq!(u64::from_be_bytes(carga[33..41].try_into().unwrap()), serie);
-                assert_eq!(u64::from_be_bytes(carga[49..57].try_into().unwrap()), *pts);
-                let mut reconstruido = Vec::new();
-                for original in nals.into_iter().filter(|n| tipo_nal(n) != Some(6)) {
-                    reconstruido.extend_from_slice(original);
-                }
-                assert_eq!(*base, reconstruido);
-                origenes.push(carga[17]);
+        for ((_, pts, base), (_, nuevo_pts, marcado)) in sin_video.into_iter().zip(con_video) {
+            assert_eq!(pts, nuevo_pts);
+            let nals = partir_annexb(marcado);
+            let nal = nals.iter().find(|n| tipo_nal(n) == Some(6)).unwrap();
+            let carga = carga_sei(nal);
+            serie += 1;
+            assert_eq!(u64::from_be_bytes(carga[33..41].try_into().unwrap()), serie);
+            assert_eq!(u64::from_be_bytes(carga[49..57].try_into().unwrap()), *pts);
+            let mut reconstruido = Vec::new();
+            for original in nals.into_iter().filter(|n| tipo_nal(n) != Some(6)) {
+                reconstruido.extend_from_slice(original);
             }
+            assert_eq!(*base, reconstruido);
+            origenes.push(carga[17]);
         }
         let mut relevos = origenes;
         relevos.dedup();

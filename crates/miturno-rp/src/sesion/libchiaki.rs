@@ -446,25 +446,47 @@ fn hilo(rx: std_mpsc::Receiver<Cmd>, propio: std_mpsc::Sender<Cmd>, ev: mpsc::Se
 mod tests {
     use super::*;
     use crate::sesion::ConLimite;
+    use std::net::{Ipv4Addr, TcpListener, TcpStream};
 
-    /// Una dirección de documentación (RFC 5737) que no responde: la sesión queda intentando conectar
-    /// varios segundos, así hay una sesión abierta que cerrar.
-    fn perfil_inalcanzable() -> Perfil {
-        Perfil {
-            host: "192.0.2.1".into(),
+    struct ConsolaLocal {
+        _turno: std::sync::MutexGuard<'static, ()>,
+        _conexion: TcpStream,
+    }
+
+    // El puerto de solicitud de sesión de Chiaki va fijo en el protocolo. Un socket de loopback
+    // mantiene abierta la negociación sin responder ni depender de rutas externas de la máquina.
+    fn iniciar_negociacion(cierres: Arc<AtomicUsize>) -> (ConsolaLocal, SesionLibchiaki) {
+        static TURNO: Mutex<()> = Mutex::new(());
+        let turno = TURNO.lock().unwrap_or_else(|e| e.into_inner());
+        let host = Ipv4Addr::new(127, 0, 0, 2);
+        let escucha = TcpListener::bind((host, 9295)).unwrap();
+        escucha.set_nonblocking(true).unwrap();
+        let perfil = Perfil {
+            host: host.to_string(),
             regist_key: *b"a1b2c3d4\0\0\0\0\0\0\0\0",
             morning: [0; 16],
             account_id: [0; 8],
             bitrate_kbps: 8000,
-        }
+        };
+        let sesion = SesionLibchiaki::con_contador(cierres).unwrap();
+        sesion.conectar(&perfil).unwrap();
+        let limite = std::time::Instant::now() + Duration::from_secs(2);
+        let conexion = loop {
+            match escucha.accept() {
+                Ok((conexion, _)) => break conexion,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && std::time::Instant::now() < limite => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("no llegó la conexión de prueba a loopback: {e}"),
+            }
+        };
+        (ConsolaLocal { _turno: turno, _conexion: conexion }, sesion)
     }
 
     #[test]
     fn soltar_el_ultimo_handle_cierra_la_sesion_una_vez() {
         let cierres = Arc::new(AtomicUsize::new(0));
-        let s = SesionLibchiaki::con_contador(cierres.clone()).unwrap();
-        s.conectar(&perfil_inalcanzable()).unwrap();
-        std::thread::sleep(Duration::from_millis(300));
+        let (_consola, s) = iniciar_negociacion(cierres.clone());
         drop(s);
         assert_eq!(cierres.load(Ordering::SeqCst), 1);
     }
@@ -475,10 +497,9 @@ mod tests {
         let c = cierres.clone();
         let r = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let (_consola, sesion) = iniciar_negociacion(c);
             rt.block_on(async move {
-                let s = Arc::new(ConLimite::new(SesionLibchiaki::con_contador(c).unwrap(), 3_000));
-                s.conectar(&perfil_inalcanzable()).unwrap();
-                tokio::time::sleep(Duration::from_millis(300)).await;
+                let _sesion = Arc::new(ConLimite::new(sesion, 3_000));
                 panic!("prueba: pánico en el ciclo");
             })
         })
@@ -490,9 +511,7 @@ mod tests {
     #[test]
     fn detener_y_despues_soltar_cierra_una_sola_vez() {
         let cierres = Arc::new(AtomicUsize::new(0));
-        let s = SesionLibchiaki::con_contador(cierres.clone()).unwrap();
-        s.conectar(&perfil_inalcanzable()).unwrap();
-        std::thread::sleep(Duration::from_millis(300));
+        let (_consola, s) = iniciar_negociacion(cierres.clone());
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(s.detener());
         assert_eq!(cierres.load(Ordering::SeqCst), 1);
